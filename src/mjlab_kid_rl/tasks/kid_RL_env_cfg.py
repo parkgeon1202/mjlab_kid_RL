@@ -432,7 +432,7 @@ coordinates cannot be subtracted directly because the sites belong to different
 foot body frames.
 """
 
-_FOOT_SEPARATION_MIN = 0.16
+_FOOT_SEPARATION_MIN = 0.13
 """Minimum allowed distance between the two foot sites [m].
 
 The compiled HOME_KEYFRAME separation is about 0.13425 m. This lower bound only
@@ -665,7 +665,7 @@ def make_kid_rl_velocity_env_cfg(
     term = deepcopy(cfg.observations["actor"].terms[term_name])
     term.noise = noise
     term.delay_min_lag = 1
-    term.delay_max_lag = 10 if DR_WIDE else 8
+    term.delay_max_lag = 4
     term.delay_update_period = 64
     cfg.observations["actor"].terms[term_name] = term
 
@@ -814,7 +814,7 @@ def make_kid_rl_velocity_env_cfg(
   # almost nothing (Episode_Reward/upright ~0.03) next to termination (~-0.99)
   # and self_collisions (~-0.62) -- doubling it to push staying-upright harder
   # before the policy ever gets punished for falling.
-  cfg.rewards["upright"].weight = 0.5
+  cfg.rewards["upright"].weight = 5.0
 
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("base_link",)
   cfg.rewards["body_ang_vel"].weight = -0.05
@@ -854,6 +854,10 @@ def make_kid_rl_velocity_env_cfg(
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      "recovery_max_tilt": np.deg2rad(15.0),
+      "recovery_max_lin_speed": 0.08,
+      "recovery_max_ang_speed": 0.08,
+      "asset_cfg": SceneEntityCfg("robot"),
     },
   )
   cfg.rewards["not_stepping"] = RewardTermCfg(
@@ -877,6 +881,10 @@ def make_kid_rl_velocity_env_cfg(
       "max_air_time": max_swing_time,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      "recovery_max_tilt": np.deg2rad(15.0),
+      "recovery_max_lin_speed": 0.08,
+      "recovery_max_ang_speed": 0.08,
+      "asset_cfg": SceneEntityCfg("robot"),
     },
   )
   del cfg.rewards["soft_landing"]
@@ -919,7 +927,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
     weight=-2.0,
-    params={"minimum_height": 0.4},
+    params={"minimum_height": 0.35},
   )
 
   # A hard cap on how far the upper body may swing off zero, covering torso_yaw,
@@ -1151,7 +1159,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.08,
+    weight=-0.03,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1330,7 +1338,9 @@ def make_kid_rl_velocity_env_cfg(
         num_stages=6,
         reward_term_name="track_linear_velocity",
         threshold_start=0.23,
-        threshold_end=3.0,
+        # Reach full push while the policy is still progressing instead of
+        # stalling near the half-strength stage at an unreachable 3.0 target.
+        threshold_end=1.5,
         push_full_scale={
           "x": 0.20,
           "y": 0.20,

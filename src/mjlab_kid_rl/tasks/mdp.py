@@ -1079,16 +1079,42 @@ class forward_step_reward:
         ).sum(dim=-1)
 
 
+def _standing_recovery_needed(
+    env: ManagerBasedRlEnv,
+    max_tilt: float,
+    max_lin_speed: float,
+    max_ang_speed: float,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Return whether a stationary robot needs an active balance recovery."""
+    asset: Entity = env.scene[asset_cfg.name]
+    gravity_b = quat_apply_inverse(
+        asset.data.root_link_quat_w, asset.data.gravity_vec_w
+    )
+    gravity_b = gravity_b / gravity_b.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    tilt = torch.asin(torch.norm(gravity_b[:, :2], dim=-1).clamp(max=1.0))
+    lin_speed = torch.norm(asset.data.root_link_lin_vel_b[:, :2], dim=-1)
+    ang_speed = torch.norm(asset.data.root_link_ang_vel_b[:, :2], dim=-1)
+    return (tilt > max_tilt) | (lin_speed > max_lin_speed) | (
+        ang_speed > max_ang_speed
+    )
+
+
 def no_stepping_penalty(
     env: ManagerBasedRlEnv,
     sensor_name: str,
     command_name: str = "twist",
     command_threshold: float = 0.01,
+    recovery_max_tilt: float = math.radians(15.0),
+    recovery_max_lin_speed: float = 0.08,
+    recovery_max_ang_speed: float = 0.08,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """
-    Penalizes feet in the air when the commanded speed is below threshold.
-    Discourages marching in place when the robot should stand still.
-    Returns the count of airborne feet per environment (use with a negative weight).
+    """Penalize lifting a foot during a stable commanded stand.
+
+    The penalty is disabled while the base is tilted or moving enough to need
+    an active recovery, so a stationary command does not suppress a recovery
+    step after a push.
     """
     command = env.command_manager.get_command(command_name)  # (N, 3)
     cmd_speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
@@ -1100,7 +1126,15 @@ def no_stepping_penalty(
         found = found.any(dim=-1)  # (N, num_feet)
     in_air = ~found.bool()
 
-    return in_air.float().sum(dim=-1) * below_threshold.float()
+    recovery_needed = _standing_recovery_needed(
+        env,
+        recovery_max_tilt,
+        recovery_max_lin_speed,
+        recovery_max_ang_speed,
+        asset_cfg,
+    )
+    stable_standing = below_threshold & ~recovery_needed
+    return in_air.float().sum(dim=-1) * stable_standing.float()
 
 
 class feet_air_time_once_reward:
@@ -1164,14 +1198,16 @@ def overlong_swing_penalty(
     max_air_time: float = 0.6,
     command_name: str = "twist",
     command_threshold: float = 0.01,
+    recovery_max_tilt: float = math.radians(15.0),
+    recovery_max_lin_speed: float = 0.08,
+    recovery_max_ang_speed: float = 0.08,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize an airborne foot immediately while standing, or after a timeout while moving.
+    """Penalize a timed-out swing unless a stationary robot is recovering.
 
-    For a standing command (magnitude at or below ``command_threshold``), the
-    penalty starts as soon as either foot loses contact; ``max_air_time`` is
-    intentionally ignored. For a moving command, the original behavior is
-    retained: the penalty starts only after ``max_air_time`` and stops on
-    contact. The result is binary in both cases.
+    ``max_air_time`` applies to both standing and moving commands; there is no
+    immediate standing-only penalty. During a disturbed commanded stand the
+    term is disabled completely, allowing a longer recovery step if necessary.
     """
     sensor: ContactSensor = env.scene[sensor_name]
     current_air_time = sensor.data.current_air_time
@@ -1180,16 +1216,19 @@ def overlong_swing_penalty(
     )
     overdue = (current_air_time > max_air_time).any(dim=-1)
 
-    found = sensor.data.found
-    if found.dim() == 3:
-        found = found.any(dim=-1)
-    any_foot_in_air = (~found.bool()).any(dim=-1)
-
     command = env.command_manager.get_command(command_name)
     assert command is not None
     cmd_speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
     standing = cmd_speed <= command_threshold
-    return torch.where(standing, any_foot_in_air, overdue).float()
+    recovery_needed = _standing_recovery_needed(
+        env,
+        recovery_max_tilt,
+        recovery_max_lin_speed,
+        recovery_max_ang_speed,
+        asset_cfg,
+    )
+    suppress_for_recovery = standing & recovery_needed
+    return (overdue & ~suppress_for_recovery).float()
 
 
 def not_stepping_penalty(

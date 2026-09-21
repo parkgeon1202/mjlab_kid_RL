@@ -12,10 +12,17 @@ from mjlab_kid_rl.tasks.mdp import (
   flatness_weighted_foot_slip_penalty,
   foot_base_heading_error_penalty,
   forward_step_reward,
+  no_stepping_penalty,
   overlong_swing_penalty,
   relative_angular_velocity_error_penalty,
   selected_action_excess_l2,
 )
+
+
+class _TestScene(dict):
+  @property
+  def sensors(self):
+    return self
 
 
 class TestFlatnessWeightedFootSlipPenalty(unittest.TestCase):
@@ -239,9 +246,18 @@ class TestOverlongSwingPenalty(unittest.TestCase):
         current_air_time=torch.tensor([[0.0, 0.0]]),
       )
     )
+    self.asset = types.SimpleNamespace(
+      data=types.SimpleNamespace(
+        root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        gravity_vec_w=torch.tensor([[0.0, 0.0, -1.0]]),
+        root_link_lin_vel_b=torch.zeros((1, 3)),
+        root_link_ang_vel_b=torch.zeros((1, 3)),
+      )
+    )
     self.command = torch.zeros((1, 3))
+    scene = _TestScene(feet=self.sensor, robot=self.asset)
     self.env = types.SimpleNamespace(
-      scene={"feet": self.sensor},
+      scene=scene,
       command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
     )
 
@@ -254,9 +270,20 @@ class TestOverlongSwingPenalty(unittest.TestCase):
       command_threshold=0.01,
     )
 
-  def test_standing_penalizes_liftoff_immediately(self) -> None:
+  def _no_stepping_penalty(self) -> torch.Tensor:
+    return no_stepping_penalty(
+      self.env,
+      sensor_name="feet",
+      command_name="twist",
+      command_threshold=0.01,
+    )
+
+  def test_standing_uses_air_time_threshold(self) -> None:
     self.sensor.data.found[:] = torch.tensor([[False, True]])
     self.sensor.data.current_air_time[:] = torch.tensor([[0.02, 0.0]])
+    torch.testing.assert_close(self._penalty(), torch.zeros(1))
+
+    self.sensor.data.current_air_time[:] = torch.tensor([[0.7, 0.0]])
     torch.testing.assert_close(self._penalty(), torch.ones(1))
 
   def test_standing_with_both_feet_down_is_not_penalized(self) -> None:
@@ -270,6 +297,26 @@ class TestOverlongSwingPenalty(unittest.TestCase):
 
     self.sensor.data.current_air_time[:] = torch.tensor([[0.7, 0.0]])
     torch.testing.assert_close(self._penalty(), torch.ones(1))
+
+  def test_stable_standing_still_penalizes_liftoff(self) -> None:
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    torch.testing.assert_close(self._no_stepping_penalty(), torch.ones(1))
+
+  def test_push_velocity_allows_recovery_step(self) -> None:
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    self.sensor.data.current_air_time[:] = torch.tensor([[0.7, 0.0]])
+    self.asset.data.root_link_lin_vel_b[:, 0] = 0.1
+    torch.testing.assert_close(self._no_stepping_penalty(), torch.zeros(1))
+    torch.testing.assert_close(self._penalty(), torch.zeros(1))
+
+  def test_static_tilt_allows_recovery_step(self) -> None:
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    self.sensor.data.current_air_time[:] = torch.tensor([[0.7, 0.0]])
+    self.asset.data.root_link_quat_w[:] = torch.tensor(
+      [[0.98480775, 0.17364818, 0.0, 0.0]]
+    )
+    torch.testing.assert_close(self._no_stepping_penalty(), torch.zeros(1))
+    torch.testing.assert_close(self._penalty(), torch.zeros(1))
 
 
 def _angular_velocity_env(command_yaw: float, actual_yaw: float):
