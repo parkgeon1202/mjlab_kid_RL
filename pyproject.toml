@@ -1,0 +1,26 @@
+[project]
+name = "mjlab-kid-rl"
+version = "0.1.0"
+description = "Velocity-tracking locomotion task for the Kid RL humanoid"
+authors = [
+    { name = "parkgeon1202", email = "geonhupark3436@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "better-actuator-models",
+    "mjlab==1.3.0",
+    "warp-lang==1.12.0",
+]
+
+[project.scripts]
+mjlab-kid-rl = "mjlab_kid_rl:main"
+
+[project.entry-points."mjlab.tasks"]
+mjlab_kid_rl = "mjlab_kid_rl.tasks"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+better-actuator-models = { git = "https://github.com/parkgeon1202/bam.git", branch = "merge-upstream" }
