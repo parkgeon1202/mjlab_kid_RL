@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from mjlab_kid_rl.tasks.mdp import (
+  airborne_foot_arm_swing_reward,
   feet_air_time_once_reward,
   feet_crossing_reward,
   feet_distance_penalty,
@@ -23,6 +24,74 @@ class _TestScene(dict):
   @property
   def sensors(self):
     return self
+
+
+class TestAirborneFootArmSwingReward(unittest.TestCase):
+  def setUp(self) -> None:
+    joint_names = ["left_shoulder_pitch", "right_shoulder_pitch"]
+    self.asset = types.SimpleNamespace(
+      data=types.SimpleNamespace(
+        joint_pos=torch.zeros((1, 2)),
+        default_joint_pos=torch.zeros((1, 2)),
+      ),
+      find_joints=lambda patterns: (
+        [joint_names.index(patterns[0].strip("^$") )],
+        [patterns[0].strip("^$")],
+      ),
+    )
+    self.sensor = types.SimpleNamespace(
+      # The real contact sensor exposes numeric 0/1 values rather than a
+      # Boolean tensor.
+      data=types.SimpleNamespace(found=torch.tensor([[1.0, 1.0]]))
+    )
+    self.command = torch.zeros((1, 3))
+    self.env = types.SimpleNamespace(
+      device="cpu",
+      scene=_TestScene(robot=self.asset, feet=self.sensor),
+      command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
+    )
+    cfg = types.SimpleNamespace(
+      params={"asset_cfg": types.SimpleNamespace(name="robot")}
+    )
+    self.term = airborne_foot_arm_swing_reward(cfg, self.env)
+
+  def _reward(self) -> torch.Tensor:
+    return self.term(
+      self.env,
+      sensor_name="feet",
+      target_angle=0.25,
+      std=0.25,
+      min_forward_command=0.1,
+      asset_cfg=types.SimpleNamespace(name="robot"),
+    )
+
+  def test_left_airborne_targets_right_arm_forward(self) -> None:
+    self.command[:] = torch.tensor([[0.2, 0.7, 0.8]])
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    # With mirrored shoulder axes, +0.25 rad sends the left arm backward and
+    # the right arm forward.
+    self.asset.data.joint_pos[:] = 0.25
+    torch.testing.assert_close(self._reward(), torch.ones(1))
+
+  def test_right_airborne_targets_left_arm_forward(self) -> None:
+    self.command[:, 0] = 0.2
+    self.sensor.data.found[:] = torch.tensor([[True, False]])
+    self.asset.data.joint_pos[:] = -0.25
+    torch.testing.assert_close(self._reward(), torch.ones(1))
+
+  def test_only_positive_vx_activates_penalty(self) -> None:
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    self.command[:] = torch.tensor([[0.0, 0.7, 0.8]])
+    torch.testing.assert_close(self._reward(), torch.zeros(1))
+
+    self.command[:, 0] = 0.2
+    torch.testing.assert_close(self._reward(), torch.tensor([torch.exp(torch.tensor(-2.0))]))
+
+  def test_zero_when_both_feet_share_contact_state(self) -> None:
+    self.command[:, 0] = 0.2
+    for found in ([[True, True]], [[False, False]]):
+      self.sensor.data.found[:] = torch.tensor(found)
+      torch.testing.assert_close(self._reward(), torch.zeros(1))
 
 
 class TestFlatnessWeightedFootSlipPenalty(unittest.TestCase):
@@ -259,6 +328,11 @@ class TestOverlongSwingPenalty(unittest.TestCase):
     self.env = types.SimpleNamespace(
       scene=scene,
       command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
+      action_manager=types.SimpleNamespace(
+        action=torch.tensor([[2.0, 0.0]]),
+        prev_action=torch.zeros((1, 2)),
+        prev_prev_action=torch.zeros((1, 2)),
+      ),
     )
 
   def _penalty(self) -> torch.Tensor:
@@ -317,7 +391,6 @@ class TestOverlongSwingPenalty(unittest.TestCase):
     )
     torch.testing.assert_close(self._no_stepping_penalty(), torch.zeros(1))
     torch.testing.assert_close(self._penalty(), torch.zeros(1))
-
 
 def _angular_velocity_env(command_yaw: float, actual_yaw: float):
   asset = types.SimpleNamespace(

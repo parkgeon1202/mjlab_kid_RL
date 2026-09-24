@@ -45,7 +45,7 @@ from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_dance_constants import (
 from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotation,
   default_joint_pose_exp,
-  contralateral_arm_swing,
+  airborne_foot_arm_swing_reward,
   feet_distance_penalty,
   base_height_penalty,
   feet_crossing_reward,
@@ -560,6 +560,11 @@ def make_kid_rl_velocity_env_cfg(
   )
 
   # ---------------------------- Terminations ----------------------
+  # Do not terminate solely because the base tilt exceeds the inherited
+  # bad-orientation threshold. A fall is still caught when a non-foot body
+  # touches the terrain.
+  cfg.terminations.pop("fell_over", None)
+
   # End the episode when anything that is not a foot touches the ground.
   # NON_FOOT_TERRAIN_CONTACT_SENSOR_CFG is registered in cfg.scene.sensors above
   # and matches all 32 non-foot bodies against the terrain body; without a term
@@ -635,22 +640,36 @@ def make_kid_rl_velocity_env_cfg(
   # (4096 counts/rev -> 0.00153 rad), which the previous 0.001 sat below.
   #
   # delay_*_lag counts *control* steps (50 Hz -> 20 ms each), unlike BAM's motor
-  # delay, which counts simulation steps. The widened arm (1-6 = 20-120 ms)
-  # exposes the policy to the occasional late serial-bus read instead of only
-  # the nominal one-to-four-tick latency.
+  # delay, which counts simulation steps.
+  #
+  # 2026-09-23: 관절 관측 지연 1-3 -> 0-1.
+  # 실기에서는 매 틱 SyncRead 로 관절값을 새로 읽고 바로 정책을 돌리므로, 정책이
+  # 받는 관절값은 1~6 ms 된 값이지 이전 스텝(20 ms 전) 값이 아니다. deploy_ws CSV
+  # 6회분(POLICY_RUNNING 17,625 틱)에서 99.13% 가 이번 틱에 읽은 값이었고, 읽기가
+  # 실패해 직전 값을 재사용한 틱이 0.84%, 2스텝 이상은 0.04% 였다.
+  # 실제 루프 지연(읽기 -> 정책 -> 쓰기 -> 서보 반응)은 '명령' 쪽에 있고, 그것은
+  # BAM 명령 지연(kid_rl_dance_constants.py _DELAY_*_LAG, 시뮬 스텝 5 ms 단위)이
+  # 모사한다. 예전처럼 여기에도 min=1 을 두면 같은 지연을 두 번 세게 된다.
+  # max=1 은 가끔 읽기가 실패해 한 스텝 늦은 값이 들어오는 경우에 대한 견고성이다
+  # (균등 분포라 학습에서는 실기 빈도보다 훨씬 자주 나온다. 좁게 학습해 실기에서
+  # 진동하는 쪽보다 낫다).
   cfg.observations["actor"].terms["joint_pos"] = ObservationTermCfg(
     func=mdp.joint_pos_rel,
     params={"asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,))},
     noise=Unoise(n_min=-0.002, n_max=0.002),
-    delay_min_lag=1,
-    delay_max_lag=6 if DR_WIDE else 4,
+    delay_min_lag=0,
+    delay_max_lag=2 if DR_WIDE else 1,
+    # 매 스텝 지연을 새로 뽑을 차례지만 80% 는 지금 지연을 유지한다(2026-09-23).
+    delay_hold_prob=0.8,
   )
   cfg.observations["actor"].terms["joint_vel"] = ObservationTermCfg(
     func=mdp.joint_vel_rel,
     params={"asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,))},
     noise=Unoise(n_min=-0.125, n_max=0.125),
-    delay_min_lag=1,
-    delay_max_lag=6 if DR_WIDE else 4,
+    delay_min_lag=0,
+    delay_max_lag=2 if DR_WIDE else 1,
+    # 매 스텝 지연을 새로 뽑을 차례지만 80% 는 지금 지연을 유지한다(2026-09-23).
+    delay_hold_prob=0.8,
   )
 
   # IMU noise/delay, actor only. What actually keeps the critic clean is its
@@ -664,9 +683,19 @@ def make_kid_rl_velocity_env_cfg(
   ):
     term = deepcopy(cfg.observations["actor"].terms[term_name])
     term.noise = noise
-    term.delay_min_lag = 1
-    term.delay_max_lag = 4
-    term.delay_update_period = 64
+    # 2026-09-23: 1-8 -> 1-3 -> 0-1. 관절 관측과 같은 논리다(위 joint_pos 주석).
+    # 실기 EBIMU 샘플은 정책이 쓰는 시점에 중앙값 5.0 ms, p99 10.1 ms, 최대 19.7 ms
+    # 묵어 있었고(POLICY_RUNNING 17,625 틱), 20 ms(1 스텝)를 넘은 틱은 0개였다.
+    # 루프 지연은 BAM 명령 지연이 모사하므로 여기서 min=1 을 두면 중복이다.
+    # max=1 은 IMU 내부 자세 필터 지연(밖에서 측정 불가)에 대한 여유다.
+    term.delay_min_lag = 0
+    term.delay_max_lag = 2 if DR_WIDE else 1
+    # 64 -> 0 (2026-09-23): 매 정책 스텝마다 새로 뽑는다. 64 면 한 번 뽑은 지연을
+    # 1.28 초 동안 유지해서, 20 ms 늦은 IMU 가 1.28 초 내내 이어지는 구간이 생겼다.
+    # 실기 EBIMU 샘플 나이는 샘플마다 0~10 ms 로 흔들리지 오래 고정되지 않는다.
+    term.delay_update_period = 0
+    # 관절 관측과 같게, 차례마다 80% 는 지금 지연을 유지한다(2026-09-23).
+    term.delay_hold_prob = 0.8
     cfg.observations["actor"].terms[term_name] = term
 
   # ---------------------------- Rewards ---------------------------
@@ -675,7 +704,7 @@ def make_kid_rl_velocity_env_cfg(
   # nontrivial velocity actually commanded" cutoff as pose/foot_clearance/
   # foot_swing_height/air_time/foot_slip, instead of an independent value.
   walking_threshold = 0.01
-  max_swing_time = 0.6
+  max_swing_time = 0.5
 
   # Keep the in-air-gated variants so a planted robot cannot collect tracking
   # reward for doing nothing.
@@ -684,14 +713,14 @@ def make_kid_rl_velocity_env_cfg(
   # width for early, imperfect steps to receive a useful tracking signal.
   # With std=0.1, a 0.3 m/s error produced exp(-9) ~= 1.2e-4, effectively
   # flattening the reward before the policy had already learned to walk.
-  cfg.rewards["track_linear_velocity"].params["std"] = 0.15
+  cfg.rewards["track_linear_velocity"].params["std"] = np.sqrt(0.1)
   cfg.rewards["track_linear_velocity"].params["sensor_name"] = FEET_GROUND_SENSOR_CFG.name
   cfg.rewards["track_linear_velocity"].params["height_sensor_name"] = FOOT_HEIGHT_SCAN_CFG.name
   cfg.rewards["track_linear_velocity"].params["command_threshold"] = walking_threshold
   cfg.rewards["track_linear_velocity"].params["max_air_time"] = max_swing_time
   cfg.rewards["track_linear_velocity"].weight = 3.0
   cfg.rewards["track_angular_velocity"].func = track_angular_velocity_gated
-  cfg.rewards["track_angular_velocity"].params["std"] = 0.15
+  cfg.rewards["track_angular_velocity"].params["std"] = np.sqrt(0.2)
   cfg.rewards["track_angular_velocity"].params["sensor_name"] = FEET_GROUND_SENSOR_CFG.name
   cfg.rewards["track_angular_velocity"].params["height_sensor_name"] = FOOT_HEIGHT_SCAN_CFG.name
   cfg.rewards["track_angular_velocity"].params["command_threshold"] = walking_threshold
@@ -814,7 +843,7 @@ def make_kid_rl_velocity_env_cfg(
   # almost nothing (Episode_Reward/upright ~0.03) next to termination (~-0.99)
   # and self_collisions (~-0.62) -- doubling it to push staying-upright harder
   # before the policy ever gets punished for falling.
-  cfg.rewards["upright"].weight = 5.0
+  cfg.rewards["upright"].weight = 1.0
 
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("base_link",)
   cfg.rewards["body_ang_vel"].weight = -0.05
@@ -854,17 +883,13 @@ def make_kid_rl_velocity_env_cfg(
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
-      "recovery_max_tilt": np.deg2rad(15.0),
-      "recovery_max_lin_speed": 0.08,
-      "recovery_max_ang_speed": 0.08,
-      "asset_cfg": SceneEntityCfg("robot"),
     },
   )
   cfg.rewards["not_stepping"] = RewardTermCfg(
     func=not_stepping_penalty,
     # At -10 this charged -0.2 on every double-support transition, making a
     # normal landing far more expensive than holding one foot up forever.
-    weight=-1.0,
+    weight=-10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -881,10 +906,6 @@ def make_kid_rl_velocity_env_cfg(
       "max_air_time": max_swing_time,
       "command_name": "twist",
       "command_threshold": walking_threshold,
-      "recovery_max_tilt": np.deg2rad(15.0),
-      "recovery_max_lin_speed": 0.08,
-      "recovery_max_ang_speed": 0.08,
-      "asset_cfg": SceneEntityCfg("robot"),
     },
   )
   del cfg.rewards["soft_landing"]
@@ -907,7 +928,9 @@ def make_kid_rl_velocity_env_cfg(
   # weight at -1 makes a flat-foot slip equivalent to the previous -10 weight,
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
   cfg.rewards["foot_slip"].weight = -3.0
-  cfg.rewards["action_rate_l2"].weight = -0.4
+  cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
+  cfg.rewards["action_rate_l2"].weight = -0.7
+  cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
     func=self_collision_cost_excluding_linkage,
@@ -918,12 +941,10 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # Soft, continuous companion to the fell_over termination (root_height <
-  # 0.2m ends the episode outright). 0.35m gives real headroom below the
-  # ~0.476-0.478m home/standing height (bent-knee default included) while
-  # still sitting well above the hard 0.2m cutoff -- a crouch/settle deep
-  # enough to start eating into that gap gets a continuously growing penalty
-  # instead of no signal at all until the episode-ending threshold hits.
+  # Continuous low-base-height penalty. 0.35m gives real headroom below the
+  # ~0.476-0.478m home/standing height (bent-knee default included); a
+  # crouch/settle deep enough to start eating into that gap gets a growing penalty
+  # while still allowing the policy to attempt recovery.
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
     weight=-2.0,
@@ -940,8 +961,7 @@ def make_kid_rl_velocity_env_cfg(
   # Each limit equals that joint's std_running above, so this is a backstop and
   # not a second shaping term: `pose` does the shaping inside the band, and this
   # only fires once a joint leaves the range `pose` would ever ask for. It also
-  # stays clear of arm_swing -- hip_pitch at std_running 0.6 times gain 0.8 asks
-  # for shoulder_pitch ~0.48, inside the 0.6 cap.
+  # stays clear of arm_swing, whose shoulder-pitch target is only 0.25 rad.
   #
   # wrist_pitch's range (-1.34..0.119) is asymmetric, so a symmetric cap really
   # only constrains the flexion side; the extension side is already bounded by
@@ -981,31 +1001,31 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # Human-like gait: right arm reaches forward while the left leg swings, and
-  # vice versa. gain=0.6 keeps the arm swing smaller than the leg swing, which is
-  # closer to how people walk than a 1:1 mirror. Gated on the command so a
-  # standing robot is not asked to swing.
+  # During positive-vx motion, coordinate shoulder pitch directly with the
+  # airborne foot using an exponential absolute-error reward. vy and wz are ignored.
   cfg.rewards["arm_swing"] = RewardTermCfg(
-    func=contralateral_arm_swing,
-    weight=0.05,
+    func=airborne_foot_arm_swing_reward,
+    weight=0.5,
     params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "target_angle": 0.5,
       "std": 0.25,
-      "gain": 0.8,
       "command_name": "twist",
-      "command_threshold": walking_threshold,
+      "min_forward_command": 0.1,
       "asset_cfg": SceneEntityCfg("robot"),
     },
   )
 
   # Fires once, on the step an episode ends by failure. `is_terminated` reads
   # termination_manager.terminated, which excludes the time_out term, so surviving
-  # the full 20 s is not penalised -- only fell_over / out_of_terrain_bounds are.
+  # the full 20 s is not penalised -- only non_foot_contact and, when enabled,
+  # out_of_terrain_bounds are.
   # scale_rewards_by_dt is on, so the weight is multiplied by step_dt (0.02):
   # the effective one-off penalty is -20, against a per-step budget where the
   # largest positive term (track_linear_velocity, weight 2.0) contributes 0.04.
   cfg.rewards["termination"] = RewardTermCfg(
     func=envs_mdp.is_terminated,
-    weight=-200.0,
+    weight=-4000.0,
     params={},
   )
   # air_time pays each foot out independently, so hopping twice on one leg
@@ -1020,7 +1040,7 @@ def make_kid_rl_velocity_env_cfg(
   # enough for a gait cycle to exist.
   cfg.rewards["same_foot_repeat"] = RewardTermCfg(
     func=same_foot_repeat_penalty,
-    weight=-1.0,
+    weight=-10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1042,7 +1062,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=3.0,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1059,7 +1079,7 @@ def make_kid_rl_velocity_env_cfg(
 
   cfg.rewards["feet_distance"] = RewardTermCfg(
     func=feet_distance_penalty,
-    weight=-50.0,
+    weight=-5.0,
     params={
       "min_dist": _FOOT_SEPARATION_MIN,
       "max_dist": _FOOT_SEPARATION_MAX,
@@ -1076,7 +1096,7 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-0.3,
+    weight=-10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
@@ -1092,7 +1112,7 @@ def make_kid_rl_velocity_env_cfg(
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-      "min_swing_height": 0.03,
+      "min_swing_height": 0.02,
       "command_name": "twist",
       "command_threshold": walking_threshold,
     },
@@ -1159,7 +1179,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.03,
+    weight=-0.3,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1221,7 +1241,7 @@ def make_kid_rl_velocity_env_cfg(
     "roll": (0.0, 0.0),
     "pitch": (0.0, 0.0),
   }
-  cfg.events["push_robot"].interval_range_s = (8.0, 10.0)
+  cfg.events["push_robot"].interval_range_s = (5.0, 20.0)
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
     r".*left_foot_collision.*",
     r".*right_foot_collision.*",
@@ -1338,15 +1358,13 @@ def make_kid_rl_velocity_env_cfg(
         num_stages=6,
         reward_term_name="track_linear_velocity",
         threshold_start=0.23,
-        # Reach full push while the policy is still progressing instead of
-        # stalling near the half-strength stage at an unreachable 3.0 target.
-        threshold_end=1.5,
+        threshold_end=3.0,
         push_full_scale={
-          "x": 0.20,
-          "y": 0.20,
-          "roll": 0.22,
-          "pitch": 0.22,
-          "yaw": 0.22,
+          "x": 0.30,
+          "y": 0.30,
+          "roll": 0.32,
+          "pitch": 0.32,
+          "yaw": 0.32,
         },
       ),
     },
@@ -1465,7 +1483,7 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     # overwhelming the asymmetric action needed to initiate a swing.
     symmetry_cfg={
       "use_data_augmentation": False,
-      "use_mirror_loss": True,
+      "use_mirror_loss": False,
       "mirror_loss_coeff": 0.1,
       "data_augmentation_func": compute_symmetric_states,
     },

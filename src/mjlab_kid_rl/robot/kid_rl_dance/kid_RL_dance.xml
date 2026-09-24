@@ -26,19 +26,19 @@
   <default>
     <default class="mx28">
       <joint armature="0.006878" damping="0.373998" frictionloss="0.011890" actuatorfrcrange="-1.4 1.4" />
-      <position kp="27.153256" kv="0" forcerange="-1.4 1.4" />
+      <position kp="30" kv="0" forcerange="-1.4 1.4" />
     </default>
     <default class="mx64v2">
       <joint armature="0.011729" damping="1.058645" frictionloss="0.075020" actuatorfrcrange="-3.0 3.0" />
-      <position kp="46.304236" kv="0" forcerange="-3.0 3.0" />
+      <position kp="51" kv="0" forcerange="-3.0 3.0" />
     </default>
     <default class="mx106v2">
       <joint armature="0.026018" damping="2.472776" frictionloss="0.000000" actuatorfrcrange="-6.0 6.0" />
-      <position kp="102.714947" kv="0" forcerange="-6.0 6.0" />
+      <position kp="113" kv="0" forcerange="-6.0 6.0" />
     </default>
     <default class="xh540">
       <joint armature="0.037943" damping="3.456983" frictionloss="0.094161" actuatorfrcrange="-8.1 8.1" />
-      <position kp="149.792960" kv="0" forcerange="-8.1 8.1" />
+      <position kp="165" kv="0" forcerange="-8.1 8.1" />
     </default>
   </default>
   <asset>
@@ -229,6 +229,10 @@
                   <joint name="left_ankle_roll_actual" pos="0 0 0" axis="1 0 0" actuatorfrcrange="-6 6" armature="1e-3" frictionloss="0.005" damping="0.04" />
                   <geom group="1" name="left_foot_collision_1" size="0.0877 0.049485 0.031995" pos="0.02082 0.01192 -0.0235" type="box" rgba="0.7 0.7 0.7 1" />
                   <geom group="1" name="left_foot_collision_2" size="0.0201 0.02765 0.03255" pos="-0.03228 9e-06 0.00195" quat="9.38184e-07 0.707105 0.707108 9.38187e-07" type="box" rgba="0.7 0.7 0.7 1" />
+                  <!-- 15 mm inward-only foot-clearance margin. Bit 32 isolates this
+                       massless, invisible proxy from the terrain and all robot
+                       geoms except its matching proxy on the other foot. -->
+                  <geom name="left_foot_inner_safety" type="box" size="0.0877 0.0075 0.031995" pos="0.02082 -0.045065 -0.0235" contype="32" conaffinity="32" condim="1" density="0" group="1" rgba="0 0 0 0" />
                   <site name="left_foot" pos="0.02082 0.01192 -0.0555" size="0.005" />
                   <body name="left_ankle_crank_1" pos="-0.00943 9e-06 0.02">
                     <geom type="mesh" mesh="left_ankle_crank_1" pos="0.030820 -0.055127 0.350834" euler="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="1 0 0 1" />
@@ -307,6 +311,7 @@
                   <joint name="right_ankle_roll_actual" pos="0 0 0" axis="1 0 0" actuatorfrcrange="-6 6" armature="1e-3" frictionloss="0.005" damping="0.04" />
                   <geom group="1" name="right_foot_collision_1" size="0.0877 0.049485 0.031995" pos="0.02082 -0.01192 -0.02351" type="box" rgba="0.7 0.7 0.7 1" />
                   <geom group="1" name="right_foot_collision_2" size="0.0201 0.02765 0.03255" pos="-0.03228 -9e-06 0.00195" quat="0.707105 0 0 -0.707108" type="box" rgba="0.7 0.7 0.7 1" />
+                  <geom name="right_foot_inner_safety" type="box" size="0.0877 0.0075 0.031995" pos="0.02082 0.045065 -0.02351" contype="32" conaffinity="32" condim="1" density="0" group="1" rgba="0 0 0 0" />
                   <site name="right_foot" pos="0.02082 -0.01192 -0.0555" size="0.005" />
                   <body name="right_ankle_crank_1" pos="-0.00943 -9e-06 0.02">
                     <geom type="mesh" mesh="right_ankle_crank_1" pos="0.032602 0.055284 0.349834" euler="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="1 0 0 1" />

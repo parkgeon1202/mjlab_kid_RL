@@ -26,7 +26,7 @@ import mujoco
 
 from mjlab_kid_rl.dr_switch import DR_WIDE
 
-from bam.mjlab import BamActuatorCfg
+from mjlab_kid_rl.robot.bam_delay import KidBamActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
@@ -62,12 +62,43 @@ _VIN_RANGE = (15.8, 16.8)
 _VIN_MIN = 15.6
 _VIN_DROP_RESISTANCE_RANGE = (0.0, 0.01)
 # Command delay, in simulation steps (0.005 s each), modeling policy->motor
-# latency: 3-6 = 15-30 ms, or 3-9 = 15-45 ms on the widened arm, which covers a
-# slower/more congested Dynamixel bus than the nominal round trip. Note this
-# constant is shared by both tasks -- the velocity task and the tracking task
-# build the same robot cfg -- so DR_WIDE moves both.
-_DELAY_MIN_LAG = 3
-_DELAY_MAX_LAG = 9 if DR_WIDE else 6
+# latency. Note this constant is shared by both tasks -- the velocity task and
+# the tracking task build the same robot cfg -- so DR_WIDE moves both.
+#
+# 2026-09-25: 2-5 (10-25 ms) -> 1-2 (5-10 ms). 명령 전달만 담당한다.
+# 실기 루프 지연 = 관측 나이 + 명령 전달이고, 관측 나이(실측 2~11 ms, CSV joint_age_*)는
+# 관측 지연(tasks/kid_RL_env_cfg.py, lag 0~1 = 0 또는 20 ms, 평균 10 ms)이 이미 덮는다.
+# 예전 2-5 는 관측 나이까지 여기에 합쳐 잡은 값이라 같은 지연을 두 번 셌다
+# (학습 루프 지연 평균 약 27 ms vs 실기 약 5~15 ms).
+# 명령 전달 = SyncWrite 호출 0.6 ms(실측, CSV prev_write_ms) + 선 위 전송 1.4 ms
+# (계산: 139 바이트 @ 1 Mbps, 서보는 패킷 끝까지 받고 CRC 확인 후 적용)
+# + 서보가 새 목표를 쓰기까지 1~2 ms(가정, 측정 안 함) = 약 3~4 ms.
+# 하한 1(5 ms)은 이 값을 덮고, 상한 2(10 ms)는 측정 안 한 서보 반영 시간에 대한 여유다.
+# 관측 지연과 합친 학습 루프 지연은 5~30 ms(평균 약 17.5 ms)로, 실기보다 짧아지는
+# 경우는 없다 -- 학습 지연이 실기보다 짧으면 실기에서 진동하므로 그쪽만은 피한다.
+_DELAY_MIN_LAG = 1
+_DELAY_MAX_LAG = 3 if DR_WIDE else 2
+# 지연값을 언제 새로 뽑는가 (2026-09-23). 세 설정을 함께 쓴다.
+# 예전에는 모두 기본값이라 물리 스텝(5 ms)마다 2~5 를 새로 뽑았다. 그러면 lag 이 커지는
+# 순간 모터가 이미 받은 새 명령 대신 이전 명령을 다시 받는 '명령 역행'이 생긴다(4096 환경,
+# 평균 5 초마다 리셋하는 모의 실행에서 물리 스텝의 6.21%). 실기 서보는 한 번 받은 목표가
+# 이전 값으로 돌아가지 않고, 버스 지연도 틱마다 널뛰지 않고 한동안 비슷하게 유지된다.
+#   _DELAY_UPDATE_PERIOD = 4   새로 뽑을 '차례'는 정책 스텝(4 물리 스텝, 20 ms)에 한 번뿐.
+#   _DELAY_HOLD_PROB = 0.6     차례가 와도 60% 는 지금 지연을 유지 -> 유지 기간이 불규칙.
+#   _DELAY_PER_ENV_PHASE = True 차례가 오는 물리 스텝을 환경마다 엇갈리게 해서, 모든 환경이
+#                               정책 스텝 경계에서 동시에 지연을 바꾸지 않게 한다.
+# CommandDelayBuffer 의 '지연은 물리 스텝당 최대 +1' 규칙 때문에 목표가 커질 때 실제 지연이
+# 몇 스텝에 걸쳐 올라가므로, hold 0.8 에서는 지연 변화가 적었다(지연이 바뀌는 스텝 5.1%).
+# 0.6 이면 10.1%, 명령 역행 0%, 평균 17.3 ms, 분포 2~5 각 23~27% (4096 환경 모의 실행).
+# 주의: mjlab DelayBuffer 는 리셋 때 lag 을 0 으로 두고 다음 차례에야 새로 뽑는다.
+# hold_prob 와 per_env_phase 를 쓰면 그 0(최솟값 2 미만)이 에피소드 초반에 남아서 물리
+# 스텝의 2.16% 가 지연 0 으로 돌았다. 그래서 아래 액추에이터들은 리셋 때 [min, max] 에서
+# 바로 뽑는 KidBamActuatorCfg(robot/bam_delay.py)로 만든다. 수정 후 그 비율은 0%.
+# 같은 클래스가 뽑은 지연을 '목표'로 두고 실제 지연은 스텝당 최대 1씩만 올려서(내려갈 땐
+# 즉시) 명령 순서가 뒤집히지 않게 한다. 지연 분포는 그대로(2~5 각 약 25%, 평균 17.4 ms).
+_DELAY_UPDATE_PERIOD = 4
+_DELAY_HOLD_PROB = 0.6
+_DELAY_PER_ENV_PHASE = True
 
 # Passive follower joints of the hip/ankle roll 4-bar linkage (coupled to the
 # actuated "_roll_crank" joint via a fixed tendon equality, not driven by their own
@@ -88,58 +119,70 @@ _PRESERVE_ROLL_LINKAGE_FRICTION = (
 # (shoulder pitch/roll/yaw, elbow, wrist) plus the 2 neck/head axes. shoulder_pitch
 # in particular moved here from MX64V2 -- the new arm uses the smaller motor, so its
 # torque ceiling drops from +/-3.0 Nm to +/-1.4 Nm.
-MX28_ACTUATOR = BamActuatorCfg(
+MX28_ACTUATOR = KidBamActuatorCfg(
   motor_name="mx28",
   model="m5",
   target_names_expr=(
     r"^(left|right)_(shoulder_pitch|shoulder_roll|shoulder_yaw|elbow_pitch|wrist_pitch)$",
     r"^(neck_yaw|head_pitch)$",
   ),
-  kp_fw=27.153256,
+  kp_fw=30,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
   max_current=1.84,
   delay_min_lag=_DELAY_MIN_LAG,
   delay_max_lag=_DELAY_MAX_LAG,
+  delay_update_period=_DELAY_UPDATE_PERIOD,
+  delay_hold_prob=_DELAY_HOLD_PROB,
+  delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
 # Only torso_yaw and the two hip yaws are left on the MX64V2 now that
 # shoulder_pitch moved to MX28.
-MX64V2_ACTUATOR = BamActuatorCfg(
+MX64V2_ACTUATOR = KidBamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
   target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
-  kp_fw=46.304236,
+  kp_fw=51,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
   max_current=6.52,
   delay_min_lag=_DELAY_MIN_LAG,
   delay_max_lag=_DELAY_MAX_LAG,
+  delay_update_period=_DELAY_UPDATE_PERIOD,
+  delay_hold_prob=_DELAY_HOLD_PROB,
+  delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
-MX106V2_ACTUATOR = BamActuatorCfg(
+MX106V2_ACTUATOR = KidBamActuatorCfg(
   motor_name="mx106v2",
   model="m5",
   target_names_expr=(r"^(left|right)_(hip|ankle)_roll_crank$",),
-  kp_fw=102.714947,
+  kp_fw=113,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
   max_current=6.8,
   delay_min_lag=_DELAY_MIN_LAG,
   delay_max_lag=_DELAY_MAX_LAG,
+  delay_update_period=_DELAY_UPDATE_PERIOD,
+  delay_hold_prob=_DELAY_HOLD_PROB,
+  delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
-XH540_ACTUATOR = BamActuatorCfg(
+XH540_ACTUATOR = KidBamActuatorCfg(
   motor_name="xh540",
   model="m5",
   target_names_expr=(r"^(left|right)_(hip_pitch|knee_pitch|ankle_pitch)$",),
-  kp_fw=149.792960,
+  kp_fw=165,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
   max_current=5.5,
   delay_min_lag=_DELAY_MIN_LAG,
   delay_max_lag=_DELAY_MAX_LAG,
+  delay_update_period=_DELAY_UPDATE_PERIOD,
+  delay_hold_prob=_DELAY_HOLD_PROB,
+  delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
 
 KID_RL_DANCE_ARTICULATION = EntityArticulationInfoCfg(
@@ -189,6 +232,11 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
 # specifies (no mixing).
 _FOOT_PATTERN = r".*_foot_collision_.*"
 
+# Invisible 15 mm extensions on only the inward face of each foot. Collision
+# bit 32 is private to this pair, so they warn the policy about foot-to-foot
+# clearance without touching the terrain or any other robot geometry.
+_FOOT_INNER_SAFETY_PATTERN = r"^(left|right)_foot_inner_safety$"
+
 # Hip/ankle parallel-linkage self-contact geoms (groove walls, roll caps). These
 # only ever touch each other (contype=conaffinity=16, isolated from the floor and
 # the rest of the robot). Also condim=3 (real sliding friction), since these
@@ -210,13 +258,23 @@ _LINKAGE_PATTERN = r"^(left|right)_(hip|ankle)_(cap|groove_wall\d)$"
 _SELF_COLLISION_PATTERN = r".*_collision"
 
 FULL_COLLISION = CollisionCfg(
-  geom_names_expr=(_FOOT_PATTERN, _LINKAGE_PATTERN, _SELF_COLLISION_PATTERN),
+  geom_names_expr=(
+    _FOOT_PATTERN,
+    _FOOT_INNER_SAFETY_PATTERN,
+    _LINKAGE_PATTERN,
+    _SELF_COLLISION_PATTERN,
+  ),
   # contype/conaffinity: feet and self-collision geoms fall back to the CollisionCfg
   # default (1). The linkage geoms must keep 16 explicitly or they'd be reset to 1
   # and start colliding with the floor/rest of the robot instead of just themselves.
-  contype={_LINKAGE_PATTERN: 16},
-  conaffinity={_LINKAGE_PATTERN: 16},
-  condim={_FOOT_PATTERN: 3, _LINKAGE_PATTERN: 3, _SELF_COLLISION_PATTERN: 1},
+  contype={_FOOT_INNER_SAFETY_PATTERN: 32, _LINKAGE_PATTERN: 16},
+  conaffinity={_FOOT_INNER_SAFETY_PATTERN: 32, _LINKAGE_PATTERN: 16},
+  condim={
+    _FOOT_PATTERN: 3,
+    _FOOT_INNER_SAFETY_PATTERN: 1,
+    _LINKAGE_PATTERN: 3,
+    _SELF_COLLISION_PATTERN: 1,
+  },
   priority={_FOOT_PATTERN: 1},
   friction={_FOOT_PATTERN: (1.0,)},
   disable_other_geoms=False,

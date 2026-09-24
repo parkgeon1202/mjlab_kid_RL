@@ -1330,12 +1330,9 @@ def base_height_penalty(
 ) -> torch.Tensor:
     """Penalize base_link dropping below a soft height floor.
 
-    Unlike root_height_below_minimum (a termination -- ends the episode once
-    crossed), this is a continuous reward: 0 while the root is at or above
-    minimum_height, growing linearly with how far below it the root is.
-    Meant as a gentler, always-on nudge to stay tall (discourage crouch-
-    walking/settling low) well before the episode-ending fell_over threshold
-    actually fires.
+    This is a continuous reward: 0 while the root is at or above
+    minimum_height, growing linearly with how far below it the root is. It
+    nudges the robot to stay tall without ending the episode based on tilt.
     """
     asset: Entity = env.scene[asset_cfg.name]
     height = asset.data.root_link_pos_w[:, 2]
@@ -1394,8 +1391,8 @@ class upper_body_excursion_penalty:
     ``std_running`` value from the ``pose`` reward, so the pose term does all
     the shaping inside the band and this term only fires once a joint leaves
     the range that reward would ever ask for. That also keeps it clear of
-    ``contralateral_arm_swing``: with hip_pitch at its std_running 0.6 and
-    gain 0.8, the arm swing asks for shoulder_pitch ~0.48, inside the 0.6 cap.
+    ``airborne_foot_arm_swing_reward`` asks for only 0.25 rad of shoulder
+    pitch excursion, comfortably inside the 0.6 rad cap.
 
     Args:
         max_excursion: Joint-name regex -> limit [rad]. Every joint selected by
@@ -2077,36 +2074,20 @@ def stepping_curriculum(
     }
 
 
-class contralateral_arm_swing:
-    """Reward human-like arm swing: each arm swings with the opposite leg.
+class airborne_foot_arm_swing_reward:
+    """Coordinate shoulder pitch with the single airborne foot during forward motion.
 
-    Converts four pitch joints into a signed "forward-ness" (positive = that limb
-    is reaching toward +x in the body frame) and rewards the right arm tracking
-    the left leg, and the left arm tracking the right leg.
-
-    The per-joint signs below are not a convention -- they were measured on the
-    compiled model, because kid_RL_v3's left/right pitch axes are mirrored in the
-    MJCF. Driving a joint +0.3 rad moves the limb tip forward for right_hip_pitch
-    and right_shoulder_pitch, and backward for left_hip_pitch and
-    left_shoulder_pitch. (The shoulder pair was intentionally flipped from its
-    original CAD-derived axes -- both hips still mirror the original mapping.)
-
-    Args:
-        std: Gaussian kernel width on the coupling error [rad].
-        gain: Arm swing amplitude relative to the leg it follows. 1.0 means the
-            arm mirrors the leg angle; below 1.0 gives a subtler swing.
-        command_name: Velocity command to gate on.
-        command_threshold: Below this commanded speed the term is switched off,
-            so a standing robot is not asked to swing its arms.
+    With the left foot airborne, the right arm should point forward and the
+    left arm backward; with the right foot airborne, the targets reverse. The
+    target error is converted to an exponential reward without squaring it.
+    Only positive ``vx`` gates the term; lateral and yaw commands do not affect
+    activation.
     """
 
-    _JOINTS = (
-        "left_hip_pitch",
-        "right_hip_pitch",
-        "left_shoulder_pitch",
-        "right_shoulder_pitch",
-    )
-    _FORWARD_SIGN = (-1.0, 1.0, -1.0, 1.0)  # measured, see docstring
+    _JOINTS = ("left_shoulder_pitch", "right_shoulder_pitch")
+    # Positive means the arm reaches toward body-frame +x. The signs were
+    # measured on the compiled model; the shoulder pitch axes are mirrored.
+    _FORWARD_SIGN = (-1.0, 1.0)
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
         asset: Entity = env.scene[cfg.params["asset_cfg"].name]
@@ -2123,28 +2104,46 @@ class contralateral_arm_swing:
     def __call__(
         self,
         env: ManagerBasedRlEnv,
-        std: float,
-        gain: float = 1.0,
-        command_name: str | None = None,
-        command_threshold: float = 0.0,
+        sensor_name: str,
+        target_angle: float = 0.25,
+        std: float = 0.25,
+        command_name: str = "twist",
+        min_forward_command: float = 0.1,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     ) -> torch.Tensor:
         asset: Entity = env.scene[asset_cfg.name]
         default = asset.data.default_joint_pos[:, self.joint_ids]
-        fwd = (asset.data.joint_pos[:, self.joint_ids] - default) * self.forward_sign
-        left_leg, right_leg, left_arm, right_arm = fwd.unbind(dim=1)
+        left_arm, right_arm = (
+            (asset.data.joint_pos[:, self.joint_ids] - default) * self.forward_sign
+        ).unbind(dim=1)
 
-        error = torch.square(right_arm - gain * left_leg) + torch.square(
-            left_arm - gain * right_leg
+        sensor: ContactSensor = env.scene.sensors[sensor_name]
+        found = sensor.data.found
+        assert found is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        found = found.bool()
+        left_air = ~found[:, 0]
+        right_air = ~found[:, 1]
+        exactly_one_airborne = left_air ^ right_air
+
+        # left foot airborne: left arm back (-), right arm forward (+).
+        # right foot airborne: the signs reverse.
+        left_target = torch.where(
+            left_air,
+            torch.full_like(left_arm, -target_angle),
+            torch.full_like(left_arm, target_angle),
         )
-        reward = torch.exp(-error / std**2)
+        right_target = -left_target
+        error = torch.abs(left_arm - left_target) + torch.abs(
+            right_arm - right_target
+        )
+        reward = torch.exp(-error / std)
 
-        if command_name is not None:
-            command = env.command_manager.get_command(command_name)
-            if command is not None:
-                speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
-                reward = reward * (speed > command_threshold).float()
-        return reward
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        active = exactly_one_airborne & (command[:, 0] > min_forward_command)
+        return reward * active.float()
 
     def reset(self, env_ids: torch.Tensor) -> None:
         del env_ids  # Unused.
