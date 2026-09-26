@@ -473,6 +473,10 @@ class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
     for event_name in (
       "push_robot",
       "foot_friction",
+      "left_hip_contact_friction",
+      "right_hip_contact_friction",
+      "left_ankle_contact_friction",
+      "right_ankle_contact_friction",
       "encoder_bias",
       "base_com",
       "body_mass_randomization",
@@ -1341,6 +1345,25 @@ def make_kid_rl_velocity_env_cfg(
   # this session (double curriculum, action-std runaway). 0.6 still gives real
   # low-friction variety without handing every env a near-ice floor.
   cfg.events["foot_friction"].params["ranges"] = (0.8, 1.2)
+  for side in ("left", "right"):
+    for joint in ("hip", "ankle"):
+      linkage = f"{side}_{joint}"
+      cfg.events[f"{linkage}_contact_friction"] = EventTermCfg(
+        mode="startup",
+        func=dr.geom_friction,
+        params={
+          "asset_cfg": SceneEntityCfg(
+            "robot",
+            geom_names=(
+              f"{linkage}_groove_wall1",
+              f"{linkage}_groove_wall2",
+              f"{linkage}_cap",
+            ),
+          ),
+          "operation": "scale",
+          "ranges": (0.8, 1.2),
+        },
+      )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
   # build/assembly tolerance on torso payload placement; the widened arm doubles
   # it and still stays well inside the support polygon at nominal stance.
