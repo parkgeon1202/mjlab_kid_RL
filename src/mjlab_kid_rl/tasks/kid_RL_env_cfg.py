@@ -74,8 +74,6 @@ from mjlab_kid_rl.tasks.mdp import (
   selected_action_excess_l2,
   upper_body_excursion_penalty,
   settled_standing_reward,
-  track_angular_velocity_gated,
-  track_linear_velocity_gated,
 )
 from mjlab_kid_rl.tasks.mdp import upright as local_upright
 from mjlab_kid_rl.tasks.symmetry import compute_symmetric_states
@@ -475,12 +473,19 @@ class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
     for event_name in (
       "push_robot",
       "foot_friction",
+      "left_hip_contact_friction",
+      "right_hip_contact_friction",
+      "left_ankle_contact_friction",
+      "right_ankle_contact_friction",
       "encoder_bias",
       "base_com",
       "body_mass_randomization",
       "torso_mass_randomization",
       "dof_armature_randomization",
-      "dof_friction_randomization",
+      "dof_cap_armature_randomization",
+      "dof_actual_armature_randomization",
+      "dof_cap_friction_randomization",
+      "dof_actual_friction_randomization",
     ):
       self.events.pop(event_name, None)
 
@@ -714,10 +719,10 @@ def make_kid_rl_velocity_env_cfg(
   #
   # With the reward's double-support band b, a leg is in stance for
   # 0.5 + arcsin(b)/pi of the cycle (exact, verified against a numerical sweep),
-  # so swing is the complement. At b=0.1 that is 0.4681, giving a 1.068 s cycle
-  # for a 0.5 s swing and a 0.534 s step period.
+  # so swing is the complement. At b=0.1 that is 0.4681, giving a 0.854 s cycle
+  # for a 0.4 s swing and a 0.427 s step period.
   _GAIT_DOUBLE_SUPPORT_BAND = 0.1
-  _GAIT_SWING_TIME = 0.5
+  _GAIT_SWING_TIME = 0.4
   _GAIT_SWING_FRACTION = 0.5 - np.arcsin(_GAIT_DOUBLE_SUPPORT_BAND) / np.pi
   _GAIT_CYCLE_TIME = float(_GAIT_SWING_TIME / _GAIT_SWING_FRACTION)
   for _group in ("actor", "critic"):
@@ -727,33 +732,22 @@ def make_kid_rl_velocity_env_cfg(
     )
 
   # ---------------------------- Rewards ---------------------------
-  # Reuse one velocity-command cutoff for tracking, upright target selection,
-  # pose, foot clearance, air time, and foot slip.
+  # Reuse one velocity-command cutoff for upright target selection, pose,
+  # foot clearance, air time, and foot slip.
   walking_threshold = 0.01
   max_swing_time = 0.5
 
-  # Pay movement tracking once at 2 cm foot clearance and once on landing.
-  # Standing commands keep continuous tracking; retain current widths/weights.
-  cfg.rewards["track_linear_velocity"].func = track_linear_velocity_gated
+  # Track commanded velocity continuously with mjlab's built-in rewards.
+  cfg.rewards["track_linear_velocity"].func = mdp.track_linear_velocity
   cfg.rewards["track_linear_velocity"].params = {
     "command_name": "twist",
     "std": np.sqrt(0.1),
-    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-    "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-    "min_air_height": 0.02,
-    "command_threshold": walking_threshold,
-    "max_air_time": max_swing_time,
   }
   cfg.rewards["track_linear_velocity"].weight = 3.0
-  cfg.rewards["track_angular_velocity"].func = track_angular_velocity_gated
+  cfg.rewards["track_angular_velocity"].func = mdp.track_angular_velocity
   cfg.rewards["track_angular_velocity"].params = {
     "command_name": "twist",
     "std": np.sqrt(0.2),
-    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-    "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-    "min_air_height": 0.02,
-    "command_threshold": walking_threshold,
-    "max_air_time": max_swing_time,
   }
   cfg.rewards["track_angular_velocity"].weight = 2.0
 
@@ -1355,6 +1349,25 @@ def make_kid_rl_velocity_env_cfg(
   # this session (double curriculum, action-std runaway). 0.6 still gives real
   # low-friction variety without handing every env a near-ice floor.
   cfg.events["foot_friction"].params["ranges"] = (0.8, 1.2)
+  for side in ("left", "right"):
+    for joint in ("hip", "ankle"):
+      linkage = f"{side}_{joint}"
+      cfg.events[f"{linkage}_contact_friction"] = EventTermCfg(
+        mode="startup",
+        func=dr.geom_friction,
+        params={
+          "asset_cfg": SceneEntityCfg(
+            "robot",
+            geom_names=(
+              f"{linkage}_groove_wall1",
+              f"{linkage}_groove_wall2",
+              f"{linkage}_cap",
+            ),
+          ),
+          "operation": "scale",
+          "ranges": (0.8, 1.2),
+        },
+      )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
   # build/assembly tolerance on torso payload placement; the widened arm doubles
   # it and still stays well inside the support polygon at nominal stance.
@@ -1397,34 +1410,60 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # Armature: all 33 scalar joints, actuated + passive. For the 25 BAM-driven joints this
-  # scales the reflected inertia BAM computed at edit_spec time (a static model
-  # constant BAM never revisits after startup, so the randomization sticks). The 4
-  # *_roll_cap joints (armature=5e-8 in the XML) get scaled too; the 4 *_roll_actual
-  # joints have no armature attribute (defaults to 0 in MuJoCo), so scaling is a
-  # no-op there -- 0 x anything is still 0.
+  # Split armature randomization into disjoint joint groups so the four
+  # *_cap and four *_actual passive joints can each use their own scale range.
+  # All eight have armature=1e-3 in the current robot XML.
+  _actuated_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
+  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
+  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
   cfg.events["dof_armature_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_armature,
     params={
-      "asset_cfg": SceneEntityCfg("robot"),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
       "operation": "scale",
-      "ranges": (0.6, 1.4) if DR_WIDE else (0.8, 1.2),
+      "ranges": _actuated_armature_range,
+    },
+  )
+  cfg.events["dof_cap_armature_randomization"] = EventTermCfg(
+    mode="startup",
+    func=dr.joint_armature,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_cap$",)),
+      "operation": "scale",
+      "ranges": _cap_armature_range,
+    },
+  )
+  cfg.events["dof_actual_armature_randomization"] = EventTermCfg(
+    mode="startup",
+    func=dr.joint_armature,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_actual$",)),
+      "operation": "scale",
+      "ranges": _actual_armature_range,
     },
   )
 
-  # Friction: the 8 passive *_roll_cap/*_roll_actual joints only (DOFS_FILTER's
-  # complement). These keep their XML-authored frictionloss untouched by BAM (see
-  # preserve_joint_friction in kid_rl_constants), so unlike the 25 actuated joints
-  # -- whose frictionloss BAM zeroes at build time and rewrites every step,
-  # making this randomization a no-op there -- it actually sticks here.
-  cfg.events["dof_friction_randomization"] = EventTermCfg(
+  # BAM owns the 25 driven joints' friction. The passive cap/actual joints
+  # are not BAM targets, so randomize their XML-authored frictionloss directly.
+  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  cfg.events["dof_cap_friction_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_friction,
     params={
-      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_(cap|actual)$",)),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_cap$",)),
       "operation": "scale",
-      "ranges": (0.5, 1.5) if DR_WIDE else (0.7, 1.3),
+      "ranges": _cap_friction_range,
+    },
+  )
+  cfg.events["dof_actual_friction_randomization"] = EventTermCfg(
+    mode="startup",
+    func=dr.joint_friction,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_actual$",)),
+      "operation": "scale",
+      "ranges": _actual_friction_range,
     },
   )
 
@@ -1552,7 +1591,7 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     # air-time stayed near zero. At iteration 1224, the entropy contribution
     # was 57.6 * 0.005 = 0.288 versus |surrogate| ~= 0.028. Reduce exploration
     # pressure while keeping a nonzero bonus for gait discovery.
-    entropy_coef=0.0005,
+    entropy_coef=0.005,
     num_learning_epochs=5,
     num_mini_batches=4,
     # A fixed, conservative rate prevents KL spikes from repeatedly pinning
