@@ -924,7 +924,7 @@ def make_kid_rl_velocity_env_cfg(
     func=not_stepping_penalty,
     # Charge only after one uninterrupted second of double support under
     # a walking command. Landing between steps resets the timer.
-    weight=-1.0,
+    weight=-0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -952,7 +952,7 @@ def make_kid_rl_velocity_env_cfg(
     weight=-2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-      "max_air_time": max_swing_time,
+      "max_air_time": 2.0,
       "command_name": "twist",
       "command_threshold": walking_threshold,
     },
@@ -978,7 +978,7 @@ def make_kid_rl_velocity_env_cfg(
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
   cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
-  cfg.rewards["action_rate_l2"].weight = -0.01
+  cfg.rewards["action_rate_l2"].weight = -0.1
   cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -996,7 +996,7 @@ def make_kid_rl_velocity_env_cfg(
   # while still allowing the policy to attempt recovery.
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
-    weight=-2000.0,
+    weight=-20.0,
     params={"minimum_height": 0.35},
   )
 
@@ -1208,7 +1208,7 @@ def make_kid_rl_velocity_env_cfg(
   # and diagonal steps; see forward_step_reward for the frame conversion.
   cfg.rewards["forward_step"] = RewardTermCfg(
     func=forward_step_reward,
-    weight=1.0,
+    weight=0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1264,7 +1264,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.0,
+    weight=-0.005,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1365,7 +1365,7 @@ def make_kid_rl_velocity_env_cfg(
             ),
           ),
           "operation": "scale",
-          "ranges": (0.8, 1.2),
+          "ranges": (1.0, 1.0),
         },
       )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
@@ -1414,8 +1414,8 @@ def make_kid_rl_velocity_env_cfg(
   # *_cap and four *_actual passive joints can each use their own scale range.
   # All eight have armature=1e-3 in the current robot XML.
   _actuated_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
-  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
-  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
+  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
+  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
   cfg.events["dof_armature_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_armature,
@@ -1446,8 +1446,8 @@ def make_kid_rl_velocity_env_cfg(
 
   # BAM owns the 25 driven joints' friction. The passive cap/actual joints
   # are not BAM targets, so randomize their XML-authored frictionloss directly.
-  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
-  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.9, 1.1)
+  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.9, 1.1)
   cfg.events["dof_cap_friction_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_friction,
