@@ -281,7 +281,7 @@ def default_joint_pose_exp(
     return reward * below_walking_threshold.float()
 
 
-def settled_standing_reward(
+def settled_standing_penalty(
     env: ManagerBasedRlEnv,
     sensor_name: str,
     command_name: str = "twist",
@@ -290,7 +290,7 @@ def settled_standing_reward(
     lin_vel_std: float = 0.15,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward a commanded stand only after both feet land and the base settles."""
+    """Penalize motion or missing foot contact during a commanded stand."""
     command = env.command_manager.get_command(command_name)
     assert command is not None
     standing = (
@@ -311,7 +311,7 @@ def settled_standing_reward(
     settled = torch.exp(
         -ang_vel_sq / ang_vel_std**2 - lin_vel_sq / lin_vel_std**2
     )
-    return settled * (standing & both_feet_planted).float()
+    return standing.float() * (1.0 - settled * both_feet_planted.float())
 
 
 class upright:
@@ -335,16 +335,11 @@ class upright:
         self,
         env: ManagerBasedRlEnv,
         std: float,
-        sensor_name: str,
-        height_sensor_name: str,
         pitch: float = 0.0,
         standing_pitch: float | None = None,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
         command_name: str = "twist",
         command_threshold: float = 0.05,
-        tracking_ratio: float = 0.8,
-        min_air_height: float = 0.02,
-        max_air_time: float = 0.6,
     ) -> torch.Tensor:
         asset: Entity = env.scene[asset_cfg.name]
 
@@ -379,11 +374,7 @@ class upright:
         )
         reward = torch.exp(-xy_error / std**2)
 
-        gate = _speed_tracking_gate(
-            env, command_name, sensor_name, height_sensor_name, asset_cfg,
-            command_threshold, tracking_ratio, min_air_height, max_air_time,
-        )
-        return reward * gate.float()
+        return reward
 
     def reset(self, env_ids: torch.Tensor) -> None:
         del env_ids  # Unused.
@@ -545,92 +536,6 @@ def foot_base_heading_error_penalty(
     ).clamp(min=-1.0, max=1.0)
     cosine_error = 1.0 - heading_cosine
     return cosine_error.mean(dim=-1)
-
-
-def _any_foot_in_air(
-    env: ManagerBasedRlEnv,
-    sensor_name: str,
-    height_sensor_name: str,
-    min_height: float = 0.02,
-) -> torch.Tensor:
-    """[B] bool: at least one tracked foot is both out of contact AND has
-    cleared min_height off the ground.
-
-    Contact alone ("found=False") isn't enough -- a foot that barely broke
-    contact (a millimeter of bounce, contact-sensor chatter) would otherwise
-    count as "airborne" and let a policy satisfy this gate without a real
-    swing. Requiring the height_sensor reading to clear min_height (mirrors
-    min_swing_height elsewhere, e.g. forward_step_reward) makes it an actual
-    ground-clearance check, not just a contact-boolean flicker.
-    """
-    sensor: ContactSensor = env.scene[sensor_name]
-    found = sensor.data.found  # (N, num_feet) or (N, num_feet, num_slots)
-    if found.dim() == 3:
-        found = found.any(dim=-1)
-    not_in_contact = ~found.bool()
-
-    height_sensor = env.scene[height_sensor_name]
-    heights = height_sensor.data.heights  # (N, num_feet)
-    cleared_height = heights >= min_height
-
-    return (not_in_contact & cleared_height).any(dim=-1)
-
-
-def _speed_tracking_gate(
-    env: ManagerBasedRlEnv,
-    command_name: str,
-    sensor_name: str,
-    height_sensor_name: str,
-    asset_cfg: SceneEntityCfg,
-    command_threshold: float,
-    tracking_ratio: float,
-    min_air_height: float,
-    max_air_time: float,
-) -> torch.Tensor:
-    """[B] bool: shared gate for track_linear_velocity_gated,
-    track_angular_velocity_gated, and upright.
-
-    cmd_speed/actual_speed are always the same combined metric --
-    norm(xy linear) + abs(yaw rate) -- regardless of which single reward is
-    asking, so "is there a real command right now" and "is the robot already
-    keeping up" mean the same thing everywhere instead of each reward judging
-    it off only its own axis (e.g. track_angular_velocity_gated checking yaw
-    rate alone would treat a robot commanded to walk straight, standing dead
-    still, as "no command" just because the yaw component of that command
-    happens to be 0).
-
-    True (gate open, reward pays out) when any of:
-    - a foot is genuinely airborne (see _any_foot_in_air) and the swing has
-      not exceeded max_air_time, or
-    - the command is at/below command_threshold -- a genuinely-commanded
-      stand, where staying planted is the *correct* response, or
-    - actual combined speed already reaches tracking_ratio of commanded
-      combined speed -- already delivering close enough that this shouldn't
-      get zeroed during a normal gait's brief double-support instants just
-      because no foot happens to be airborne on that exact frame.
-    """
-    asset: Entity = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    actual_lin = asset.data.root_link_lin_vel_b
-    actual_ang = asset.data.root_link_ang_vel_b
-    actual_speed = torch.norm(actual_lin[:, :2], dim=-1) + torch.abs(actual_ang[:, 2])
-    cmd_speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
-
-    trivial_command = cmd_speed <= command_threshold
-    already_tracking = actual_speed >= tracking_ratio * cmd_speed
-
-    sensor: ContactSensor = env.scene[sensor_name]
-    current_air_time = sensor.data.current_air_time
-    assert current_air_time is not None, (
-        f"Sensor '{sensor_name}' needs track_air_time=True for the tracking gate."
-    )
-    overdue_swing = (current_air_time > max_air_time).any(dim=-1)
-    moving_gate = (
-        _any_foot_in_air(env, sensor_name, height_sensor_name, min_air_height)
-        | already_tracking
-    ) & ~overdue_swing
-    return trivial_command | moving_gate
 
 
 class _LandingTrackingReward:

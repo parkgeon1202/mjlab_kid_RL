@@ -1,5 +1,6 @@
 """Focused tests for kid_RL velocity-tracking reward terms."""
 
+import math
 import types
 import unittest
 
@@ -231,53 +232,40 @@ class TestSelectedActionExcessL2(unittest.TestCase):
       selected_action_excess_l2(cfg, env)
 
 
-class TestUprightSpeedGate(unittest.TestCase):
+class TestUprightReward(unittest.TestCase):
   def setUp(self) -> None:
     self.command = torch.tensor([[0.2, 0.0, 0.0]])
     self.asset = types.SimpleNamespace(data=types.SimpleNamespace(
       body_link_quat_w=torch.tensor([[[1.0, 0.0, 0.0, 0.0]]]),
       gravity_vec_w=torch.tensor([[0.0, 0.0, -1.0]]),
-      root_link_lin_vel_b=torch.zeros((1, 3)),
-      root_link_ang_vel_b=torch.zeros((1, 3)),
-    ))
-    self.contact = types.SimpleNamespace(data=types.SimpleNamespace(
-      found=torch.tensor([[1, 1]]),
-      current_air_time=torch.zeros((1, 2)),
-    ))
-    self.height = types.SimpleNamespace(data=types.SimpleNamespace(
-      heights=torch.zeros((1, 2)),
     ))
     self.env = types.SimpleNamespace(
-      scene={"robot": self.asset, "feet": self.contact, "height": self.height},
+      scene={"robot": self.asset},
       command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
     )
     self.term = upright(types.SimpleNamespace(params={}), self.env)
 
   def _reward(self) -> torch.Tensor:
     return self.term(
-      self.env, std=0.3, pitch=0.0, standing_pitch=0.0,
-      sensor_name="feet", height_sensor_name="height",
+      self.env, std=0.2, pitch=0.0, standing_pitch=0.0,
       asset_cfg=types.SimpleNamespace(name="robot", body_ids=[0]),
-      command_threshold=0.01, max_air_time=0.5,
+      command_threshold=0.01,
     )
 
-  def test_moving_command_with_both_feet_planted_does_not_pay(self) -> None:
-    torch.testing.assert_close(self._reward(), torch.zeros(1))
-
-  def test_foot_above_two_centimeters_pays_until_overlong(self) -> None:
-    self.contact.data.found[0, 0] = 0
-    self.height.data.heights[0, 0] = 0.02
-    torch.testing.assert_close(self._reward(), torch.ones(1))
-    self.contact.data.current_air_time[0, 0] = 0.6
-    torch.testing.assert_close(self._reward(), torch.zeros(1))
-
-  def test_already_tracking_pays_with_both_feet_planted(self) -> None:
-    self.asset.data.root_link_lin_vel_b[0, 0] = 0.17
+  def test_moving_command_pays_without_foot_or_speed_gate(self) -> None:
     torch.testing.assert_close(self._reward(), torch.ones(1))
 
-  def test_standing_command_pays_with_both_feet_planted(self) -> None:
+  def test_standing_command_pays(self) -> None:
     self.command[:] = 0.0
     torch.testing.assert_close(self._reward(), torch.ones(1))
+
+  def test_tilt_reduces_reward_at_narrower_std(self) -> None:
+    angle = 0.2
+    self.asset.data.gravity_vec_w[:] = torch.tensor([
+      [math.sin(angle), 0.0, -math.cos(angle)]
+    ])
+    expected = torch.exp(torch.tensor(-math.sin(angle) ** 2 / 0.2**2))
+    torch.testing.assert_close(self._reward(), expected.unsqueeze(0))
 
 
 class TestSplitVelocityTracking(unittest.TestCase):

@@ -26,7 +26,7 @@ import mujoco
 
 from mjlab_kid_rl.dr_switch import DR_WIDE
 
-from mjlab_kid_rl.robot.bam_delay import KidBamActuatorCfg
+from bam.mjlab import BamActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
@@ -78,24 +78,8 @@ _VIN_DROP_RESISTANCE_RANGE = (0.0, 0.01)
 # 경우는 없다 -- 학습 지연이 실기보다 짧으면 실기에서 진동하므로 그쪽만은 피한다.
 _DELAY_MIN_LAG = 1
 _DELAY_MAX_LAG = 3 if DR_WIDE else 2
-# 지연값을 언제 새로 뽑는가 (2026-09-23). 세 설정을 함께 쓴다.
-# 예전에는 모두 기본값이라 물리 스텝(5 ms)마다 2~5 를 새로 뽑았다. 그러면 lag 이 커지는
-# 순간 모터가 이미 받은 새 명령 대신 이전 명령을 다시 받는 '명령 역행'이 생긴다(4096 환경,
-# 평균 5 초마다 리셋하는 모의 실행에서 물리 스텝의 6.21%). 실기 서보는 한 번 받은 목표가
-# 이전 값으로 돌아가지 않고, 버스 지연도 틱마다 널뛰지 않고 한동안 비슷하게 유지된다.
-#   _DELAY_UPDATE_PERIOD = 4   새로 뽑을 '차례'는 정책 스텝(4 물리 스텝, 20 ms)에 한 번뿐.
-#   _DELAY_HOLD_PROB = 0.6     차례가 와도 60% 는 지금 지연을 유지 -> 유지 기간이 불규칙.
-#   _DELAY_PER_ENV_PHASE = True 차례가 오는 물리 스텝을 환경마다 엇갈리게 해서, 모든 환경이
-#                               정책 스텝 경계에서 동시에 지연을 바꾸지 않게 한다.
-# CommandDelayBuffer 의 '지연은 물리 스텝당 최대 +1' 규칙 때문에 목표가 커질 때 실제 지연이
-# 몇 스텝에 걸쳐 올라가므로, hold 0.8 에서는 지연 변화가 적었다(지연이 바뀌는 스텝 5.1%).
-# 0.6 이면 10.1%, 명령 역행 0%, 평균 17.3 ms, 분포 2~5 각 23~27% (4096 환경 모의 실행).
-# 주의: mjlab DelayBuffer 는 리셋 때 lag 을 0 으로 두고 다음 차례에야 새로 뽑는다.
-# hold_prob 와 per_env_phase 를 쓰면 그 0(최솟값 2 미만)이 에피소드 초반에 남아서 물리
-# 스텝의 2.16% 가 지연 0 으로 돌았다. 그래서 아래 액추에이터들은 리셋 때 [min, max] 에서
-# 바로 뽑는 KidBamActuatorCfg(robot/bam_delay.py)로 만든다. 수정 후 그 비율은 0%.
-# 같은 클래스가 뽑은 지연을 '목표'로 두고 실제 지연은 스텝당 최대 1씩만 올려서(내려갈 땐
-# 즉시) 명령 순서가 뒤집히지 않게 한다. 지연 분포는 그대로(2~5 각 약 25%, 평균 17.4 ms).
+# Use BAM's stock DelayBuffer sampling. Without the removed local subclass,
+# lag can briefly be zero after reset and a rising lag can revisit an older command.
 _DELAY_UPDATE_PERIOD = 4
 _DELAY_HOLD_PROB = 0.6
 _DELAY_PER_ENV_PHASE = True
@@ -119,7 +103,7 @@ _PRESERVE_ROLL_LINKAGE_FRICTION = (
 # (shoulder pitch/roll/yaw, elbow, wrist) plus the 2 neck/head axes. shoulder_pitch
 # in particular moved here from MX64V2 -- the new arm uses the smaller motor, so its
 # torque ceiling drops from +/-3.0 Nm to +/-1.4 Nm.
-MX28_ACTUATOR = KidBamActuatorCfg(
+MX28_ACTUATOR = BamActuatorCfg(
   motor_name="mx28",
   model="m5",
   target_names_expr=(
@@ -139,7 +123,7 @@ MX28_ACTUATOR = KidBamActuatorCfg(
 )
 # Only torso_yaw and the two hip yaws are left on the MX64V2 now that
 # shoulder_pitch moved to MX28.
-MX64V2_ACTUATOR = KidBamActuatorCfg(
+MX64V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
   target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
@@ -154,7 +138,7 @@ MX64V2_ACTUATOR = KidBamActuatorCfg(
   delay_hold_prob=_DELAY_HOLD_PROB,
   delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
-MX106V2_ACTUATOR = KidBamActuatorCfg(
+MX106V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx106v2",
   model="m5",
   target_names_expr=(r"^(left|right)_(hip|ankle)_roll_crank$",),
@@ -169,7 +153,7 @@ MX106V2_ACTUATOR = KidBamActuatorCfg(
   delay_hold_prob=_DELAY_HOLD_PROB,
   delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
-XH540_ACTUATOR = KidBamActuatorCfg(
+XH540_ACTUATOR = BamActuatorCfg(
   motor_name="xh540",
   model="m5",
   target_names_expr=(r"^(left|right)_(hip_pitch|knee_pitch|ankle_pitch)$",),

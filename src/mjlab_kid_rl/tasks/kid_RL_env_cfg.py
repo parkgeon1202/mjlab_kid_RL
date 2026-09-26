@@ -73,9 +73,7 @@ from mjlab_kid_rl.tasks.mdp import (
   reward_based_staged_curriculum,
   selected_action_excess_l2,
   upper_body_excursion_penalty,
-  settled_standing_reward,
-  track_angular_velocity_gated,
-  track_linear_velocity_gated,
+  settled_standing_penalty,
 )
 from mjlab_kid_rl.tasks.mdp import upright as local_upright
 from mjlab_kid_rl.tasks.symmetry import compute_symmetric_states
@@ -480,7 +478,10 @@ class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
       "body_mass_randomization",
       "torso_mass_randomization",
       "dof_armature_randomization",
-      "dof_friction_randomization",
+      "dof_cap_armature_randomization",
+      "dof_actual_armature_randomization",
+      "dof_cap_friction_randomization",
+      "dof_actual_friction_randomization",
     ):
       self.events.pop(event_name, None)
 
@@ -714,10 +715,10 @@ def make_kid_rl_velocity_env_cfg(
   #
   # With the reward's double-support band b, a leg is in stance for
   # 0.5 + arcsin(b)/pi of the cycle (exact, verified against a numerical sweep),
-  # so swing is the complement. At b=0.1 that is 0.4681, giving a 1.068 s cycle
-  # for a 0.5 s swing and a 0.534 s step period.
+  # so swing is the complement. At b=0.1 that is 0.4681, giving a 0.854 s cycle
+  # for a 0.4 s swing and a 0.427 s step period.
   _GAIT_DOUBLE_SUPPORT_BAND = 0.1
-  _GAIT_SWING_TIME = 0.5
+  _GAIT_SWING_TIME = 0.4
   _GAIT_SWING_FRACTION = 0.5 - np.arcsin(_GAIT_DOUBLE_SUPPORT_BAND) / np.pi
   _GAIT_CYCLE_TIME = float(_GAIT_SWING_TIME / _GAIT_SWING_FRACTION)
   for _group in ("actor", "critic"):
@@ -727,33 +728,22 @@ def make_kid_rl_velocity_env_cfg(
     )
 
   # ---------------------------- Rewards ---------------------------
-  # Reuse one velocity-command cutoff for tracking, upright target selection,
-  # pose, foot clearance, air time, and foot slip.
+  # Reuse one velocity-command cutoff for upright target selection, pose,
+  # foot clearance, air time, and foot slip.
   walking_threshold = 0.01
   max_swing_time = 0.5
 
-  # Pay movement tracking once at 2 cm foot clearance and once on landing.
-  # Standing commands keep continuous tracking; retain current widths/weights.
-  cfg.rewards["track_linear_velocity"].func = track_linear_velocity_gated
+  # Track commanded velocity continuously with mjlab's built-in rewards.
+  cfg.rewards["track_linear_velocity"].func = mdp.track_linear_velocity
   cfg.rewards["track_linear_velocity"].params = {
     "command_name": "twist",
     "std": np.sqrt(0.1),
-    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-    "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-    "min_air_height": 0.02,
-    "command_threshold": walking_threshold,
-    "max_air_time": max_swing_time,
   }
   cfg.rewards["track_linear_velocity"].weight = 3.0
-  cfg.rewards["track_angular_velocity"].func = track_angular_velocity_gated
+  cfg.rewards["track_angular_velocity"].func = mdp.track_angular_velocity
   cfg.rewards["track_angular_velocity"].params = {
     "command_name": "twist",
     "std": np.sqrt(0.2),
-    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-    "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-    "min_air_height": 0.02,
-    "command_threshold": walking_threshold,
-    "max_air_time": max_swing_time,
   }
   cfg.rewards["track_angular_velocity"].weight = 2.0
 
@@ -861,11 +851,8 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("base_link",)
   cfg.rewards["upright"].params["pitch"] = np.deg2rad(0.0)
   cfg.rewards["upright"].params["standing_pitch"] = 0.0
-  cfg.rewards["upright"].params["std"] = np.sqrt(0.1)
-  cfg.rewards["upright"].params["sensor_name"] = FEET_GROUND_SENSOR_CFG.name
-  cfg.rewards["upright"].params["height_sensor_name"] = FOOT_HEIGHT_SCAN_CFG.name
+  cfg.rewards["upright"].params["std"] = 0.2
   cfg.rewards["upright"].params["command_threshold"] = walking_threshold
-  cfg.rewards["upright"].params["max_air_time"] = max_swing_time
   # Bumped 1.0 -> 2.0: the fell_over-dominated run showed upright contributing
   # almost nothing (Episode_Reward/upright ~0.03) next to termination (~-0.99)
   # and self_collisions (~-0.62) -- doubling it to push staying-upright harder
@@ -895,7 +882,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["air_time"].params = {
     "sensor_name": FEET_GROUND_SENSOR_CFG.name,
     "threshold_min": 0.2,
-    "threshold_max": max_swing_time,
+    "threshold_max": max_swing_time-0.1,
     "command_name": "twist",
     "command_threshold": walking_threshold,
   }
@@ -912,11 +899,10 @@ def make_kid_rl_velocity_env_cfg(
       "command_threshold": walking_threshold,
     },
   )
-  # This pays out only after a stationary robot has settled on both feet.
-  # Disturbed motion has a small score, so a recovery step is not suppressed.
+  # Penalize missing foot contact or base motion during a stand command.
   cfg.rewards["settled_standing"] = RewardTermCfg(
-    func=settled_standing_reward,
-    weight=0.5,
+    func=settled_standing_penalty,
+    weight=-1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -930,7 +916,7 @@ def make_kid_rl_velocity_env_cfg(
     func=not_stepping_penalty,
     # Charge only after one uninterrupted second of double support under
     # a walking command. Landing between steps resets the timer.
-    weight=-1.0,
+    weight=-0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -943,7 +929,7 @@ def make_kid_rl_velocity_env_cfg(
   # weight=-500 gives an actual one-step cost of -10 per overdue foot.
   cfg.rewards["not_stepping_each_foot"] = RewardTermCfg(
     func=not_stepping_each_foot_penalty,
-    weight=-2.0,
+    weight=-1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -984,7 +970,7 @@ def make_kid_rl_velocity_env_cfg(
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
   cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
-  cfg.rewards["action_rate_l2"].weight = -0.01
+  cfg.rewards["action_rate_l2"].weight = -0.05
   cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -1104,7 +1090,7 @@ def make_kid_rl_velocity_env_cfg(
   # not the penalty, is what shapes alternation.
   cfg.rewards["gait_phase_contact"] = RewardTermCfg(
     func=gait_phase_contact_reward,
-    weight=10.0,
+    weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1117,7 +1103,7 @@ def make_kid_rl_velocity_env_cfg(
   # one-off 2 cm crossing reward and 0.2 s air-time reward can activate.
   cfg.rewards["gait_phase_swing_clearance"] = RewardTermCfg(
     func=gait_phase_swing_clearance_reward,
-    weight=10.0,
+    weight=0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1198,7 +1184,7 @@ def make_kid_rl_velocity_env_cfg(
   # Keep the one-off bonus when the next qualifying foot is the opposite one.
   cfg.rewards["feet_crossing"] = RewardTermCfg(
     func=feet_crossing_reward,
-    weight=2.0,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1214,7 +1200,7 @@ def make_kid_rl_velocity_env_cfg(
   # and diagonal steps; see forward_step_reward for the frame conversion.
   cfg.rewards["forward_step"] = RewardTermCfg(
     func=forward_step_reward,
-    weight=1.0,
+    weight=0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1258,7 +1244,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["foot_base_heading_error"] = RewardTermCfg(
     func=foot_base_heading_error_penalty,
-    weight=-0.1,
+    weight=-0.2,
     params={
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
     },
@@ -1270,7 +1256,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.0,
+    weight=-0.008,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1324,16 +1310,16 @@ def make_kid_rl_velocity_env_cfg(
 
   # ---------------------------- Events ----------------------------
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
-  # Keep the tilt small enough to avoid large foot penetration on reset.
-  init_tilt = float(np.deg2rad(0.0))
+  # Sample initial base roll and pitch in either direction.
+  init_tilt = float(np.deg2rad(30.0))
   cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
   cfg.events["reset_base"].params["pose_range"]["pitch"] = (-init_tilt, init_tilt)
   # Randomize only actuated joints; the passive roll-linkage followers are
   # constrained by the mechanism and must not be offset independently.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.0, 0.0),
-      "velocity_range": (-0.0, 0.0),
+      "position_range": (-0.1, 0.1),
+      "velocity_range": (-0.1, 0.1),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
     }
   )
@@ -1397,34 +1383,60 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # Armature: all 33 scalar joints, actuated + passive. For the 25 BAM-driven joints this
-  # scales the reflected inertia BAM computed at edit_spec time (a static model
-  # constant BAM never revisits after startup, so the randomization sticks). The 4
-  # *_roll_cap joints (armature=5e-8 in the XML) get scaled too; the 4 *_roll_actual
-  # joints have no armature attribute (defaults to 0 in MuJoCo), so scaling is a
-  # no-op there -- 0 x anything is still 0.
+  # Split armature randomization into disjoint joint groups so the four
+  # *_cap and four *_actual passive joints can each use their own scale range.
+  # All eight have armature=1e-3 in the current robot XML.
+  _actuated_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
+  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
+  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
   cfg.events["dof_armature_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_armature,
     params={
-      "asset_cfg": SceneEntityCfg("robot"),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
       "operation": "scale",
-      "ranges": (0.6, 1.4) if DR_WIDE else (0.8, 1.2),
+      "ranges": _actuated_armature_range,
+    },
+  )
+  cfg.events["dof_cap_armature_randomization"] = EventTermCfg(
+    mode="startup",
+    func=dr.joint_armature,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_cap$",)),
+      "operation": "scale",
+      "ranges": _cap_armature_range,
+    },
+  )
+  cfg.events["dof_actual_armature_randomization"] = EventTermCfg(
+    mode="startup",
+    func=dr.joint_armature,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_actual$",)),
+      "operation": "scale",
+      "ranges": _actual_armature_range,
     },
   )
 
-  # Friction: the 8 passive *_roll_cap/*_roll_actual joints only (DOFS_FILTER's
-  # complement). These keep their XML-authored frictionloss untouched by BAM (see
-  # preserve_joint_friction in kid_rl_constants), so unlike the 25 actuated joints
-  # -- whose frictionloss BAM zeroes at build time and rewrites every step,
-  # making this randomization a no-op there -- it actually sticks here.
-  cfg.events["dof_friction_randomization"] = EventTermCfg(
+  # BAM owns the 25 driven joints' friction. The passive cap/actual joints
+  # are not BAM targets, so randomize their XML-authored frictionloss directly.
+  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  cfg.events["dof_cap_friction_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_friction,
     params={
-      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_(cap|actual)$",)),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_cap$",)),
       "operation": "scale",
-      "ranges": (0.5, 1.5) if DR_WIDE else (0.7, 1.3),
+      "ranges": _cap_friction_range,
+    },
+  )
+  cfg.events["dof_actual_friction_randomization"] = EventTermCfg(
+    mode="startup",
+    func=dr.joint_friction,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*_actual$",)),
+      "operation": "scale",
+      "ranges": _actual_friction_range,
     },
   )
 
@@ -1464,11 +1476,11 @@ def make_kid_rl_velocity_env_cfg(
         threshold_start=0.23,
         threshold_end=3.0,
         push_full_scale={
-          "x": 0.0,
-          "y": 0.0,
-          "roll": 0.0,
-          "pitch": 0.0,
-          "yaw": 0.0,
+          "x": 0.3,
+          "y": 0.3,
+          "roll": 0.32,
+          "pitch": 0.32,
+          "yaw": 0.32,
         },
       ),
     },
@@ -1548,11 +1560,7 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     value_loss_coef=1.0,
     use_clipped_value_loss=True,
     clip_param=0.2,
-    # In the 2026-09-26 gait run, mean action std rose 1.27 -> 2.45 while
-    # air-time stayed near zero. At iteration 1224, the entropy contribution
-    # was 57.6 * 0.005 = 0.288 versus |surrogate| ~= 0.028. Reduce exploration
-    # pressure while keeping a nonzero bonus for gait discovery.
-    entropy_coef=0.0005,
+    entropy_coef=0.005,
     num_learning_epochs=5,
     num_mini_batches=4,
     # A fixed, conservative rate prevents KL spikes from repeatedly pinning
