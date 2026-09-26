@@ -50,6 +50,14 @@ _VECTOR_TERMS = {
     # (vx, vy, wz): the linear part flips in y, the yaw rate flips outright.
     "command": (1.0, -1.0, -1.0),
     "velocity_commands": (1.0, -1.0, -1.0),
+    # [sin(2*pi*phase), cos(2*pi*phase)]. Mirroring a gait
+    # swaps which leg is swinging, which *is* a half-cycle shift of the clock:
+    # phase -> phase + 0.5, so sin and cos both negate (sin(x+pi) = -sin x,
+    # cos(x+pi) = -cos x) while the period itself is unchanged. This is the
+    # half-cycle phase offset stated directly in the observation, and it is
+    # what makes the mirror consistent with a walking gait rather than with
+    # both legs moving together.
+    "gait_phase": (-1.0, -1.0),
 }
 # Per-foot scalars: mirroring just swaps the two feet.
 _FOOT_SCALAR_TERMS = ("foot_height", "foot_air_time", "foot_contact")

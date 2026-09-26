@@ -51,8 +51,11 @@ from mjlab_kid_rl.tasks.mdp import (
   feet_crossing_reward,
   foot_flatness_penalty,
   flatness_weighted_foot_slip_penalty,
-  feet_air_time_once_reward,
+  feet_air_time_continuous_reward,
   forward_step_reward,
+  gait_phase,
+  gait_phase_contact_reward,
+  gait_phase_swing_clearance_reward,
   gait_symmetry_reward,
   velocity_shortfall_penalty,
   relative_angular_velocity_error_penalty,
@@ -61,6 +64,7 @@ from mjlab_kid_rl.tasks.mdp import (
   log_solver_buffer_usage,
   no_stepping_penalty,
   not_stepping_penalty,
+  not_stepping_each_foot_penalty,
   overlong_swing_penalty,
   same_foot_repeat_penalty,
   self_collision_cost_excluding_linkage,
@@ -69,6 +73,7 @@ from mjlab_kid_rl.tasks.mdp import (
   reward_based_staged_curriculum,
   selected_action_excess_l2,
   upper_body_excursion_penalty,
+  settled_standing_reward,
   track_angular_velocity_gated,
   track_linear_velocity_gated,
 )
@@ -698,33 +703,58 @@ def make_kid_rl_velocity_env_cfg(
     term.delay_hold_prob = 0.8
     cfg.observations["actor"].terms[term_name] = term
 
+  # Gait clock. See gait_phase's docstring for why a limit cycle needs an
+  # external rhythm rather than more penalties on standing. Fixed, not
+  # randomised: see the docstring for why.
+  #
+  # Stated as swing time -- how long one foot is off the ground, which is the
+  # number that is actually being specified -- and the cycle is derived, since
+  # mixing the two up is easy: one cycle is *two* steps, so cycle_time is a bit
+  # over twice the swing.
+  #
+  # With the reward's double-support band b, a leg is in stance for
+  # 0.5 + arcsin(b)/pi of the cycle (exact, verified against a numerical sweep),
+  # so swing is the complement. At b=0.1 that is 0.4681, giving a 1.068 s cycle
+  # for a 0.5 s swing and a 0.534 s step period.
+  _GAIT_DOUBLE_SUPPORT_BAND = 0.1
+  _GAIT_SWING_TIME = 0.5
+  _GAIT_SWING_FRACTION = 0.5 - np.arcsin(_GAIT_DOUBLE_SUPPORT_BAND) / np.pi
+  _GAIT_CYCLE_TIME = float(_GAIT_SWING_TIME / _GAIT_SWING_FRACTION)
+  for _group in ("actor", "critic"):
+    cfg.observations[_group].terms["gait_phase"] = ObservationTermCfg(
+      func=gait_phase,
+      params={"cycle_time": _GAIT_CYCLE_TIME},
+    )
+
   # ---------------------------- Rewards ---------------------------
-  # Moved up from the pose-reward block below so the in_air-gated rewards
-  # (track_linear/angular_velocity, upright) can share the same "is a
-  # nontrivial velocity actually commanded" cutoff as pose/foot_clearance/
-  # foot_swing_height/air_time/foot_slip, instead of an independent value.
+  # Reuse one velocity-command cutoff for tracking, upright target selection,
+  # pose, foot clearance, air time, and foot slip.
   walking_threshold = 0.01
   max_swing_time = 0.5
 
-  # Keep the in-air-gated variants so a planted robot cannot collect tracking
-  # reward for doing nothing.
+  # Pay movement tracking once at 2 cm foot clearance and once on landing.
+  # Standing commands keep continuous tracking; retain current widths/weights.
   cfg.rewards["track_linear_velocity"].func = track_linear_velocity_gated
-  # Keep these values fixed throughout the push curriculum, but leave enough
-  # width for early, imperfect steps to receive a useful tracking signal.
-  # With std=0.1, a 0.3 m/s error produced exp(-9) ~= 1.2e-4, effectively
-  # flattening the reward before the policy had already learned to walk.
-  cfg.rewards["track_linear_velocity"].params["std"] = np.sqrt(0.1)
-  cfg.rewards["track_linear_velocity"].params["sensor_name"] = FEET_GROUND_SENSOR_CFG.name
-  cfg.rewards["track_linear_velocity"].params["height_sensor_name"] = FOOT_HEIGHT_SCAN_CFG.name
-  cfg.rewards["track_linear_velocity"].params["command_threshold"] = walking_threshold
-  cfg.rewards["track_linear_velocity"].params["max_air_time"] = max_swing_time
+  cfg.rewards["track_linear_velocity"].params = {
+    "command_name": "twist",
+    "std": np.sqrt(0.1),
+    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+    "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+    "min_air_height": 0.02,
+    "command_threshold": walking_threshold,
+    "max_air_time": max_swing_time,
+  }
   cfg.rewards["track_linear_velocity"].weight = 3.0
   cfg.rewards["track_angular_velocity"].func = track_angular_velocity_gated
-  cfg.rewards["track_angular_velocity"].params["std"] = np.sqrt(0.2)
-  cfg.rewards["track_angular_velocity"].params["sensor_name"] = FEET_GROUND_SENSOR_CFG.name
-  cfg.rewards["track_angular_velocity"].params["height_sensor_name"] = FOOT_HEIGHT_SCAN_CFG.name
-  cfg.rewards["track_angular_velocity"].params["command_threshold"] = walking_threshold
-  cfg.rewards["track_angular_velocity"].params["max_air_time"] = max_swing_time
+  cfg.rewards["track_angular_velocity"].params = {
+    "command_name": "twist",
+    "std": np.sqrt(0.2),
+    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+    "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+    "min_air_height": 0.02,
+    "command_threshold": walking_threshold,
+    "max_air_time": max_swing_time,
+  }
   cfg.rewards["track_angular_velocity"].weight = 2.0
 
   # Keyed by joint-name regex. ".*hip_roll.*" etc. also match the passive
@@ -809,7 +839,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["pose"].params["std_running"] = std_running
   cfg.rewards["pose"].params["walking_threshold"] = walking_threshold
   cfg.rewards["pose"].params["running_threshold"] = running_threshold
-  cfg.rewards["pose"].weight = 1.0
+  cfg.rewards["pose"].weight = 0.0
 
   # At commands below walking_threshold, independently reward holding the
   # HOME_KEYFRAME pose. The target comes from robot.data.default_joint_pos, so
@@ -829,12 +859,9 @@ def make_kid_rl_velocity_env_cfg(
 
   cfg.rewards["upright"].func = local_upright
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("base_link",)
-  cfg.rewards["upright"].params["pitch"] = np.deg2rad(10.0)
+  cfg.rewards["upright"].params["pitch"] = np.deg2rad(0.0)
+  cfg.rewards["upright"].params["standing_pitch"] = 0.0
   cfg.rewards["upright"].params["std"] = np.sqrt(0.1)
-  # Same in_air gate as track_linear/angular_velocity_gated -- see upright's
-  # docstring/gate comment: standing statically upright is the trivial way to
-  # max this reward, so it shouldn't pay out while a nontrivial velocity is
-  # commanded and no foot is off the ground.
   cfg.rewards["upright"].params["sensor_name"] = FEET_GROUND_SENSOR_CFG.name
   cfg.rewards["upright"].params["height_sensor_name"] = FOOT_HEIGHT_SCAN_CFG.name
   cfg.rewards["upright"].params["command_threshold"] = walking_threshold
@@ -854,7 +881,7 @@ def make_kid_rl_velocity_env_cfg(
   # Target swing height scaled to this robot: ~0.476 m tall with ~0.14 m shins,
   # vs the template's 0.1 m default sized for a ~1.3 m humanoid.
   cfg.rewards["foot_clearance"].params["command_threshold"] = walking_threshold
-  cfg.rewards["foot_clearance"].params["target_height"] = 0.03
+  cfg.rewards["foot_clearance"].params["target_height"] = 0.02
   # This is not a positive "lift the foot" reward. Its cost is
   # |height - target| * foot_xy_speed, so it teaches an already-moving swing
   # foot to travel near 3 cm clearance. The one-shot feet_crossing term below
@@ -864,7 +891,7 @@ def make_kid_rl_velocity_env_cfg(
   # lands.  Remove it: reaching 3 cm is rewarded immediately by feet_crossing.
   del cfg.rewards["foot_swing_height"]
 
-  cfg.rewards["air_time"].func = feet_air_time_once_reward
+  cfg.rewards["air_time"].func = feet_air_time_continuous_reward
   cfg.rewards["air_time"].params = {
     "sensor_name": FEET_GROUND_SENSOR_CFG.name,
     "threshold_min": 0.2,
@@ -872,28 +899,56 @@ def make_kid_rl_velocity_env_cfg(
     "command_name": "twist",
     "command_threshold": walking_threshold,
   }
-  # Unlike the stock term, this pays only once at landing when the completed
-  # swing lasted 0.2--0.6 s. Holding a foot up pays nothing until it lands.
+  # Pay every step while exactly one foot has been airborne for 0.2--0.5 s.
+  # Landing and overlong swings receive no air-time reward.
   cfg.rewards["air_time"].weight = 1.0
 
   cfg.rewards["no_stepping"] = RewardTermCfg(
     func=no_stepping_penalty,
-    weight=-0.3,
+    weight=0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
     },
   )
-  cfg.rewards["not_stepping"] = RewardTermCfg(
-    func=not_stepping_penalty,
-    # At -10 this charged -0.2 on every double-support transition, making a
-    # normal landing far more expensive than holding one foot up forever.
-    weight=-10.0,
+  # This pays out only after a stationary robot has settled on both feet.
+  # Disturbed motion has a small score, so a recovery step is not suppressed.
+  cfg.rewards["settled_standing"] = RewardTermCfg(
+    func=settled_standing_reward,
+    weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      "ang_vel_std": 0.3,
+      "lin_vel_std": 0.15,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
+  )
+  cfg.rewards["not_stepping"] = RewardTermCfg(
+    func=not_stepping_penalty,
+    # Charge only after one uninterrupted second of double support under
+    # a walking command. Landing between steps resets the timer.
+    weight=-1.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "min_duration_s": 1.0,
+    },
+  )
+  # Independently charge each foot that has not lost ground contact for 2 s
+  # under a walking command. RewardManager multiplies by step_dt=0.02, so
+  # weight=-500 gives an actual one-step cost of -10 per overdue foot.
+  cfg.rewards["not_stepping_each_foot"] = RewardTermCfg(
+    func=not_stepping_each_foot_penalty,
+    weight=-2.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "max_time_without_lift_s": 2.0,
     },
   )
   cfg.rewards["overlong_swing"] = RewardTermCfg(
@@ -927,9 +982,9 @@ def make_kid_rl_velocity_env_cfg(
   # The function carries the 1x--10x state-dependent scale. Keeping the outer
   # weight at -1 makes a flat-foot slip equivalent to the previous -10 weight,
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
-  cfg.rewards["foot_slip"].weight = -3.0
+  cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
-  cfg.rewards["action_rate_l2"].weight = -0.7
+  cfg.rewards["action_rate_l2"].weight = -0.01
   cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -947,7 +1002,7 @@ def make_kid_rl_velocity_env_cfg(
   # while still allowing the policy to attempt recovery.
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
-    weight=-2.0,
+    weight=-2000.0,
     params={"minimum_height": 0.35},
   )
 
@@ -1025,7 +1080,7 @@ def make_kid_rl_velocity_env_cfg(
   # largest positive term (track_linear_velocity, weight 2.0) contributes 0.04.
   cfg.rewards["termination"] = RewardTermCfg(
     func=envs_mdp.is_terminated,
-    weight=-4000.0,
+    weight=-200.0,
     params={},
   )
   # air_time pays each foot out independently, so hopping twice on one leg
@@ -1038,9 +1093,45 @@ def make_kid_rl_velocity_env_cfg(
   # (no_stepping already pushes the other way, and the two would fight). Raise it
   # once Episode_Reward/same_foot_repeat is nonzero and episodes survive long
   # enough for a gait cycle to exist.
+  # Humanoid-Gym's feet_contact_number, unchanged: score each foot against the
+  # stance mask the clock implies. Standing through a walk command scores 0.35
+  # (one foot always agrees with an alternating mask), correct alternation
+  # scores 1.0 -- so the weight has to be big enough that the 0.65 gap beats
+  # what standing already collects elsewhere. This is the term that is meant to
+  # do the work the -30 penalties could not. Note same_foot_repeat (-30) now
+  # says the same thing far more bluntly and is the weight that turned
+  # standing into falling; consider dropping it back toward -1 so the clock,
+  # not the penalty, is what shapes alternation.
+  cfg.rewards["gait_phase_contact"] = RewardTermCfg(
+    func=gait_phase_contact_reward,
+    weight=10.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
+    },
+  )
+
+  # Give immediate progress toward the clock-selected swing, before the
+  # one-off 2 cm crossing reward and 0.2 s air-time reward can activate.
+  cfg.rewards["gait_phase_swing_clearance"] = RewardTermCfg(
+    func=gait_phase_swing_clearance_reward,
+    weight=10.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
+      "min_height": 0.005,
+      "target_height": 0.02,
+    },
+  )
+
   cfg.rewards["same_foot_repeat"] = RewardTermCfg(
     func=same_foot_repeat_penalty,
-    weight=-10.0,
+    weight=-1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1062,7 +1153,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=1.0,
+    weight=1.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1079,7 +1170,7 @@ def make_kid_rl_velocity_env_cfg(
 
   cfg.rewards["feet_distance"] = RewardTermCfg(
     func=feet_distance_penalty,
-    weight=-5.0,
+    weight=-1.0,
     params={
       "min_dist": _FOOT_SEPARATION_MIN,
       "max_dist": _FOOT_SEPARATION_MAX,
@@ -1096,23 +1187,23 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-10.0,
+    weight=-1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
     },
   )
 
-  # One-shot swing-height milestone: each foot pays once when it first clears
-  # 3 cm during commanded single support. Holding it there pays nothing more;
-  # landing rearms that foot for the next swing.
+  # Pay once per swing when a foot first clears 2 cm; rearm on landing.
+  # Keep the one-off bonus when the next qualifying foot is the opposite one.
   cfg.rewards["feet_crossing"] = RewardTermCfg(
     func=feet_crossing_reward,
-    weight=1.0,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
       "min_swing_height": 0.02,
+      "alternation_bonus": 1.0,
       "command_name": "twist",
       "command_threshold": walking_threshold,
     },
@@ -1123,7 +1214,7 @@ def make_kid_rl_velocity_env_cfg(
   # and diagonal steps; see forward_step_reward for the frame conversion.
   cfg.rewards["forward_step"] = RewardTermCfg(
     func=forward_step_reward,
-    weight=0.5,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1134,7 +1225,7 @@ def make_kid_rl_velocity_env_cfg(
       # the 0.31 m stride the retargeted human walk shows for this robot at
       # 0.32 m/s, so a step has to land within a few centimetres of what the
       # command implies to score most of the term.
-      "std": 0.05,
+      "std": 0.1,
       "min_step_distance": 0.02,
       "min_swing_height": 0.02,
     },
@@ -1179,7 +1270,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.3,
+    weight=-0.0,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1206,7 +1297,7 @@ def make_kid_rl_velocity_env_cfg(
   # Match the 20 s episode horizon: reset samples one fresh command and the
   # timeout resets the environment before an in-episode resample can occur.
   # Both bounds are required; ``(20.0)`` would be a float, not a one-item tuple.
-  command.resampling_time_range = (3.0, 20.0)
+  command.resampling_time_range = (20.0, 20.0)
   command.rel_standing_envs = 0.1
   command.rel_heading_envs = 0.0
   command.rel_rotation_envs = 0.1
@@ -1233,8 +1324,21 @@ def make_kid_rl_velocity_env_cfg(
 
   # ---------------------------- Events ----------------------------
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
-  # Push starts disabled. The staged curriculum below ramps it to x/y +/-0.20
-  # and roll/pitch +/-0.22; DR_WIDE still controls the other DR ranges.
+  # Keep the tilt small enough to avoid large foot penetration on reset.
+  init_tilt = float(np.deg2rad(0.0))
+  cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
+  cfg.events["reset_base"].params["pose_range"]["pitch"] = (-init_tilt, init_tilt)
+  # Randomize only actuated joints; the passive roll-linkage followers are
+  # constrained by the mechanism and must not be offset independently.
+  cfg.events["reset_robot_joints"].params.update(
+    {
+      "position_range": (-0.0, 0.0),
+      "velocity_range": (-0.0, 0.0),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
+    }
+  )
+  # Push velocity is zero initially and at every curriculum stage below.
+  # DR_WIDE still controls the other DR ranges.
   cfg.events["push_robot"].params["velocity_range"] = {
     "x": (0.0, 0.0),
     "y": (0.0, 0.0),
@@ -1360,11 +1464,11 @@ def make_kid_rl_velocity_env_cfg(
         threshold_start=0.23,
         threshold_end=3.0,
         push_full_scale={
-          "x": 0.30,
-          "y": 0.30,
-          "roll": 0.32,
-          "pitch": 0.32,
-          "yaw": 0.32,
+          "x": 0.0,
+          "y": 0.0,
+          "roll": 0.0,
+          "pitch": 0.0,
+          "yaw": 0.0,
         },
       ),
     },
@@ -1444,27 +1548,11 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     value_loss_coef=1.0,
     use_clipped_value_loss=True,
     clip_param=0.2,
-    # 0.01 let the entropy bonus swamp the policy gradient. Measured at
-    # iteration 17k: Loss/entropy 42.15 x 0.01 = 0.42 against a surrogate loss of
-    # -0.0175 -- a 24x imbalance, i.e. the update was optimising entropy, not the
-    # task. That drove a self-reinforcing trap:
-    #
-    #   entropy bonus pushes the action std up hard each update
-    #     -> the policy distribution moves a lot between updates -> large KL
-    #     -> the adaptive scheduler below divides the LR by 1.5 per minibatch
-    #        (20 per iteration, so it reaches its own max(1e-5, ...) floor within
-    #        a single iteration)
-    #     -> at 1e-5 nothing is learned, the surrogate loss stays tiny
-    #     -> entropy keeps dominating
-    #
-    # The symptoms were an action std that rose from init_std 1.0 to ~1.39 and
-    # saturated there, Loss/learning_rate pinned at the 1e-5 floor, and mean
-    # reward / episode length flat for 2250 iterations.
-    #
-    # Keep some exploration pressure without recreating the observed
-    # std=1.5 runaway. This matches the value described by the analysis above;
-    # the previous literal 0.005 did not match that comment.
-    entropy_coef=0.005,
+    # In the 2026-09-26 gait run, mean action std rose 1.27 -> 2.45 while
+    # air-time stayed near zero. At iteration 1224, the entropy contribution
+    # was 57.6 * 0.005 = 0.288 versus |surrogate| ~= 0.028. Reduce exploration
+    # pressure while keeping a nonzero bonus for gait discovery.
+    entropy_coef=0.0005,
     num_learning_epochs=5,
     num_mini_batches=4,
     # A fixed, conservative rate prevents KL spikes from repeatedly pinning
