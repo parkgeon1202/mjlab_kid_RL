@@ -251,19 +251,18 @@ class UniformVelocityCommandWithRotationCfg(UniformVelocityCommandCfg):
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
-def default_joint_pose_exp(
+def default_joint_pose_deviation(
     env: ManagerBasedRlEnv,
     std: float,
     command_name: str,
     walking_threshold: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward the default keyframe pose only for commands below walking speed.
+    """Return squared deviation from HOME_KEYFRAME during a stand command.
 
-    The robot's ``default_joint_pos`` is initialized from ``HOME_KEYFRAME``.
-    The returned reward is 1 at that pose and decays with the mean squared joint
-    error as ``exp(-mean(error**2) / std**2)``.  Commands at or above
-    ``walking_threshold`` receive zero so this term does not resist locomotion.
+    The robot's ``default_joint_pos`` comes from ``HOME_KEYFRAME``. The
+    penalty is zero at that pose, grows as ``mean(error**2) / std**2``, and
+    is zero for walking commands so it does not resist stepping.
     """
     asset: Entity = env.scene[asset_cfg.name]
     default_joint_pos = asset.data.default_joint_pos
@@ -277,8 +276,7 @@ def default_joint_pose_exp(
     joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
     target_joint_pos = default_joint_pos[:, asset_cfg.joint_ids]
     mean_squared_error = torch.mean(torch.square(joint_pos - target_joint_pos), dim=1)
-    reward = torch.exp(-mean_squared_error / std**2)
-    return reward * below_walking_threshold.float()
+    return mean_squared_error / std**2 * below_walking_threshold.float()
 
 
 def settled_standing_penalty(
@@ -2302,12 +2300,20 @@ class airborne_foot_arm_swing_reward:
 
     With the left foot airborne, the right arm should point forward and the
     left arm backward; with the right foot airborne, the targets reverse. The
-    target error is converted to an exponential reward without squaring it.
-    Only positive ``vx`` gates the term; lateral and yaw commands do not affect
-    activation.
+    On straight forward commands, both arms must move in their target directions
+    to earn a positive score; a wrong or stationary arm scores negatively. For
+    other commands, penalize the squared raw actions of all ten arm joints.
     """
 
     _JOINTS = ("left_shoulder_pitch", "right_shoulder_pitch")
+    _ARM_JOINTS = tuple(
+        f"{side}_{joint}"
+        for side in ("left", "right")
+        for joint in (
+            "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+            "elbow_pitch", "wrist_pitch",
+        )
+    )
     # Positive means the arm reaches toward body-frame +x. The signs were
     # measured on the compiled model; the shoulder pitch axes are mirrored.
     _FORWARD_SIGN = (-1.0, 1.0)
@@ -2323,6 +2329,16 @@ class airborne_foot_arm_swing_reward:
         self.forward_sign = torch.tensor(
             self._FORWARD_SIGN, dtype=torch.float32, device=env.device
         )
+        action_term = env.action_manager.get_term(cfg.params["action_name"])
+        action_names = list(action_term.target_names)
+        missing = [name for name in self._ARM_JOINTS if name not in action_names]
+        if missing:
+            raise ValueError(f"Arm joints missing from action targets: {missing}")
+        self.arm_action_ids = torch.tensor(
+            [action_names.index(name) for name in self._ARM_JOINTS],
+            dtype=torch.long,
+            device=env.device,
+        )
 
     def __call__(
         self,
@@ -2332,6 +2348,9 @@ class airborne_foot_arm_swing_reward:
         std: float = 0.25,
         command_name: str = "twist",
         min_forward_command: float = 0.1,
+        max_lateral_command: float = 0.1,
+        max_yaw_command: float = 0.05,
+        action_name: str = "joint_pos",
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     ) -> torch.Tensor:
         asset: Entity = env.scene[asset_cfg.name]
@@ -2358,15 +2377,32 @@ class airborne_foot_arm_swing_reward:
             torch.full_like(left_arm, target_angle),
         )
         right_target = -left_target
-        error = torch.abs(left_arm - left_target) + torch.abs(
-            right_arm - right_target
+        left_error = torch.abs(left_arm - left_target)
+        right_error = torch.abs(right_arm - right_target)
+        both_correct = (left_arm * left_target > 0.0) & (
+            right_arm * right_target > 0.0
         )
-        reward = torch.exp(-error / std)
+        correct_reward = torch.exp(-(left_error + right_error) / std)
+        wrong_error = torch.where(
+            left_arm * left_target > 0.0, 0.0, left_error
+        ) + torch.where(right_arm * right_target > 0.0, 0.0, right_error)
+        wrong_penalty = -torch.clamp(wrong_error / (2.0 * target_angle), max=1.0)
+        score = torch.where(both_correct, correct_reward, wrong_penalty)
 
         command = env.command_manager.get_command(command_name)
         assert command is not None
-        active = exactly_one_airborne & (command[:, 0] > min_forward_command)
-        return reward * active.float()
+        straight_forward = (
+            (command[:, 0] > min_forward_command)
+            & (torch.abs(command[:, 1]) <= max_lateral_command)
+            & (torch.abs(command[:, 2]) < max_yaw_command)
+        )
+        raw_action = env.action_manager.get_term(action_name).raw_action
+        arm_action_penalty = raw_action[:, self.arm_action_ids].square().sum(dim=-1)
+        return torch.where(
+            straight_forward,
+            score * exactly_one_airborne.float(),
+            -arm_action_penalty,
+        )
 
     def reset(self, env_ids: torch.Tensor) -> None:
         del env_ids  # Unused.

@@ -44,7 +44,7 @@ from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_dance_constants import (
 )
 from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotation,
-  default_joint_pose_exp,
+  default_joint_pose_deviation,
   airborne_foot_arm_swing_reward,
   feet_distance_penalty,
   base_height_penalty,
@@ -833,16 +833,13 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["pose"].params["std_running"] = std_running
   cfg.rewards["pose"].params["walking_threshold"] = walking_threshold
   cfg.rewards["pose"].params["running_threshold"] = running_threshold
-  cfg.rewards["pose"].weight = 0.0
+  cfg.rewards["pose"].weight = 1.0
 
-  # At commands below walking_threshold, independently reward holding the
-  # HOME_KEYFRAME pose. The target comes from robot.data.default_joint_pos, so
-  # this stays synchronized with HOME_KEYFRAME without duplicating joint angles
-  # here. At/above the threshold the reward is exactly zero and cannot resist
-  # the walking motion. Tune its contribution with this term's weight.
+  # Penalize squared joint deviation from HOME_KEYFRAME during stand commands.
+  # The target comes from robot.data.default_joint_pos; walking is unaffected.
   cfg.rewards["default_joint_pose"] = RewardTermCfg(
-    func=default_joint_pose_exp,
-    weight=1.0,
+    func=default_joint_pose_deviation,
+    weight=-3.0,
     params={
       "std": 0.15,
       "command_name": "twist",
@@ -920,7 +917,7 @@ def make_kid_rl_velocity_env_cfg(
     func=not_stepping_penalty,
     # Charge only after one uninterrupted second of double support under
     # a walking command. Landing between steps resets the timer.
-    weight=-0.0,
+    weight=-1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -933,7 +930,7 @@ def make_kid_rl_velocity_env_cfg(
   # weight=-500 gives an actual one-step cost of -10 per overdue foot.
   cfg.rewards["not_stepping_each_foot"] = RewardTermCfg(
     func=not_stepping_each_foot_penalty,
-    weight=-1.0,
+    weight=-10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -974,7 +971,7 @@ def make_kid_rl_velocity_env_cfg(
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
   cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
-  cfg.rewards["action_rate_l2"].weight = -0.05
+  cfg.rewards["action_rate_l2"].weight = -0.6
   cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -992,7 +989,7 @@ def make_kid_rl_velocity_env_cfg(
   # while still allowing the policy to attempt recovery.
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
-    weight=-2000.0,
+    weight=-20.0,
     params={"minimum_height": 0.35},
   )
 
@@ -1023,10 +1020,10 @@ def make_kid_rl_velocity_env_cfg(
       "max_excursion": {
         r".*torso_yaw.*": 0.3,
         r".*shoulder_pitch.*": 0.6,
-        r".*shoulder_roll.*": 0.6,
-        r".*shoulder_yaw.*": 0.3,
+        r".*shoulder_roll.*": 0.2,
+        r".*shoulder_yaw.*": 0.2,
         r".*elbow.*": 0.3,
-        r".*wrist_pitch.*": 0.3,
+        r".*wrist_pitch.*": 0.2,
         r"neck_yaw": 0.15,
         r"head_pitch": 0.15,
       },
@@ -1046,17 +1043,20 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # During positive-vx motion, coordinate shoulder pitch directly with the
-  # airborne foot using an exponential absolute-error reward. vy and wz are ignored.
+  # During straight forward motion, score both arms against the airborne foot.
+  # Otherwise penalize the squared raw actions of all ten arm joints.
   cfg.rewards["arm_swing"] = RewardTermCfg(
     func=airborne_foot_arm_swing_reward,
     weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-      "target_angle": 0.5,
+      "target_angle": 0.15,
       "std": 0.25,
       "command_name": "twist",
       "min_forward_command": 0.1,
+      "max_lateral_command": 0.1,
+      "max_yaw_command": 0.05,
+      "action_name": "joint_pos",
       "asset_cfg": SceneEntityCfg("robot"),
     },
   )
@@ -1070,7 +1070,7 @@ def make_kid_rl_velocity_env_cfg(
   # largest positive term (track_linear_velocity, weight 2.0) contributes 0.04.
   cfg.rewards["termination"] = RewardTermCfg(
     func=envs_mdp.is_terminated,
-    weight=-200.0,
+    weight=-400.0,
     params={},
   )
   # air_time pays each foot out independently, so hopping twice on one leg
@@ -1121,7 +1121,7 @@ def make_kid_rl_velocity_env_cfg(
 
   cfg.rewards["same_foot_repeat"] = RewardTermCfg(
     func=same_foot_repeat_penalty,
-    weight=-1.0,
+    weight=-0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1177,7 +1177,7 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-1.0,
+    weight=-2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
@@ -1223,7 +1223,7 @@ def make_kid_rl_velocity_env_cfg(
 
   cfg.rewards["velocity_shortfall"] = RewardTermCfg(
     func=velocity_shortfall_penalty,
-    weight=-0.3,
+    weight=-0.6,
     params={"command_name": "twist"},
   )
   cfg.rewards["relative_linear_velocity_error"] = RewardTermCfg(
@@ -1248,7 +1248,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["foot_base_heading_error"] = RewardTermCfg(
     func=foot_base_heading_error_penalty,
-    weight=-0.2,
+    weight=-0.5,
     params={
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
     },
@@ -1260,7 +1260,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.008,
+    weight=-0.2,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1287,7 +1287,7 @@ def make_kid_rl_velocity_env_cfg(
   # Match the 20 s episode horizon: reset samples one fresh command and the
   # timeout resets the environment before an in-episode resample can occur.
   # Both bounds are required; ``(20.0)`` would be a float, not a one-item tuple.
-  command.resampling_time_range = (20.0, 20.0)
+  command.resampling_time_range = (5.0, 20.0)
   command.rel_standing_envs = 0.1
   command.rel_heading_envs = 0.0
   command.rel_rotation_envs = 0.1
@@ -1298,8 +1298,8 @@ def make_kid_rl_velocity_env_cfg(
   # vx/vy/wz sample.
   command.rel_forward_only_envs = 0.1
   command.rel_backward_only_envs = 0.1
-  command.rel_lateral_only_envs = 0.1
-  command.rel_planar_only_envs = 0.2
+  command.rel_lateral_only_envs = 0.2
+  command.rel_planar_only_envs = 0.3
   command.directional_min_lin_vel = 0.05
   # Use this task's explicit forward-only sampler instead of the template's
   # separate forward-mode distribution.
@@ -1315,15 +1315,15 @@ def make_kid_rl_velocity_env_cfg(
   # ---------------------------- Events ----------------------------
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
   # Sample initial base roll and pitch in either direction.
-  init_tilt = float(np.deg2rad(30.0))
+  init_tilt = float(np.deg2rad(10.0))
   cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
   cfg.events["reset_base"].params["pose_range"]["pitch"] = (-init_tilt, init_tilt)
   # Randomize only actuated joints; the passive roll-linkage followers are
   # constrained by the mechanism and must not be offset independently.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.1, 0.1),
-      "velocity_range": (-0.1, 0.1),
+      "position_range": (-0.3, 0.3),
+      "velocity_range": (-0.3, 0.3),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
     }
   )
@@ -1361,7 +1361,7 @@ def make_kid_rl_velocity_env_cfg(
             ),
           ),
           "operation": "scale",
-          "ranges": (0.8, 1.2),
+          "ranges": (0.7, 1.3),
         },
       )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
