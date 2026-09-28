@@ -8,6 +8,7 @@ import torch
 
 from mjlab_kid_rl.tasks.mdp import (
   airborne_foot_arm_swing_reward,
+  default_joint_pose_deviation,
   feet_air_time_continuous_reward,
   feet_crossing_reward,
   feet_distance_penalty,
@@ -33,6 +34,35 @@ class _TestScene(dict):
     return self
 
 
+class TestDefaultJointPoseDeviation(unittest.TestCase):
+  def test_zero_at_default_and_penalizes_only_standing_deviation(self) -> None:
+    default = torch.tensor([[0.1, -0.2]])
+    asset = types.SimpleNamespace(
+      data=types.SimpleNamespace(
+        joint_pos=default.clone(),
+        default_joint_pos=default,
+      )
+    )
+    command = torch.zeros((1, 3))
+    env = types.SimpleNamespace(
+      scene=_TestScene(robot=asset),
+      command_manager=types.SimpleNamespace(get_command=lambda _: command),
+    )
+    asset_cfg = types.SimpleNamespace(name="robot", joint_ids=[0, 1])
+
+    def deviation() -> torch.Tensor:
+      return default_joint_pose_deviation(
+        env, std=0.15, command_name="twist",
+        walking_threshold=0.01, asset_cfg=asset_cfg,
+      )
+
+    torch.testing.assert_close(deviation(), torch.zeros(1))
+    asset.data.joint_pos[0, 0] += 0.15
+    torch.testing.assert_close(deviation(), torch.tensor([0.5]))
+    command[0, 0] = 0.2
+    torch.testing.assert_close(deviation(), torch.zeros(1))
+
+
 class TestAirborneFootArmSwingReward(unittest.TestCase):
   def setUp(self) -> None:
     joint_names = ["left_shoulder_pitch", "right_shoulder_pitch"]
@@ -52,13 +82,21 @@ class TestAirborneFootArmSwingReward(unittest.TestCase):
       data=types.SimpleNamespace(found=torch.tensor([[1.0, 1.0]]))
     )
     self.command = torch.zeros((1, 3))
+    self.arm_action = types.SimpleNamespace(
+      target_names=airborne_foot_arm_swing_reward._ARM_JOINTS,
+      raw_action=torch.zeros((1, 10)),
+    )
     self.env = types.SimpleNamespace(
       device="cpu",
       scene=_TestScene(robot=self.asset, feet=self.sensor),
       command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
+      action_manager=types.SimpleNamespace(get_term=lambda _: self.arm_action),
     )
     cfg = types.SimpleNamespace(
-      params={"asset_cfg": types.SimpleNamespace(name="robot")}
+      params={
+        "asset_cfg": types.SimpleNamespace(name="robot"),
+        "action_name": "joint_pos",
+      }
     )
     self.term = airborne_foot_arm_swing_reward(cfg, self.env)
 
@@ -69,11 +107,14 @@ class TestAirborneFootArmSwingReward(unittest.TestCase):
       target_angle=0.25,
       std=0.25,
       min_forward_command=0.1,
+      max_lateral_command=0.1,
+      max_yaw_command=0.05,
+      action_name="joint_pos",
       asset_cfg=types.SimpleNamespace(name="robot"),
     )
 
   def test_left_airborne_targets_right_arm_forward(self) -> None:
-    self.command[:] = torch.tensor([[0.2, 0.7, 0.8]])
+    self.command[:] = torch.tensor([[0.2, 0.0, 0.0]])
     self.sensor.data.found[:] = torch.tensor([[False, True]])
     # With mirrored shoulder axes, +0.25 rad sends the left arm backward and
     # the right arm forward.
@@ -86,13 +127,40 @@ class TestAirborneFootArmSwingReward(unittest.TestCase):
     self.asset.data.joint_pos[:] = -0.25
     torch.testing.assert_close(self._reward(), torch.ones(1))
 
-  def test_only_positive_vx_activates_penalty(self) -> None:
-    self.sensor.data.found[:] = torch.tensor([[False, True]])
-    self.command[:] = torch.tensor([[0.0, 0.7, 0.8]])
-    torch.testing.assert_close(self._reward(), torch.zeros(1))
-
+  def test_one_wrong_arm_receives_penalty(self) -> None:
     self.command[:, 0] = 0.2
-    torch.testing.assert_close(self._reward(), torch.tensor([torch.exp(torch.tensor(-2.0))]))
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    # Left arm is correctly back; right arm is incorrectly back too.
+    self.asset.data.joint_pos[:] = torch.tensor([[0.25, -0.25]])
+    torch.testing.assert_close(self._reward(), torch.tensor([-1.0]))
+
+  def test_stationary_arm_receives_penalty(self) -> None:
+    self.command[:, 0] = 0.2
+    self.sensor.data.found[:] = torch.tensor([[True, False]])
+    # Right arm is correctly back; left arm stays at its default.
+    self.asset.data.joint_pos[:] = torch.tensor([[0.0, -0.25]])
+    torch.testing.assert_close(self._reward(), torch.tensor([-0.5]))
+
+  def test_nonstraight_command_penalizes_all_arm_actions(self) -> None:
+    self.command[:] = torch.tensor([[0.2, 0.12, 0.0]])
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    self.asset.data.joint_pos[:] = 0.25
+    self.arm_action.raw_action[0, 0] = 0.5  # shoulder pitch
+    self.arm_action.raw_action[0, 8] = -0.3  # elbow pitch
+    torch.testing.assert_close(self._reward(), torch.tensor([-0.34]))
+
+    self.command[:] = torch.tensor([[0.2, 0.0, 0.1]])
+    torch.testing.assert_close(self._reward(), torch.tensor([-0.34]))
+
+    self.command[:] = torch.tensor([[0.0, 0.0, 0.0]])
+    torch.testing.assert_close(self._reward(), torch.tensor([-0.34]))
+
+  def test_straight_forward_uses_arm_alignment_instead_of_action_cost(self) -> None:
+    self.command[:] = torch.tensor([[0.2, 0.1, 0.0]])
+    self.sensor.data.found[:] = torch.tensor([[False, True]])
+    self.asset.data.joint_pos[:] = 0.25
+    self.arm_action.raw_action[:] = 1.0
+    torch.testing.assert_close(self._reward(), torch.ones(1))
 
   def test_zero_when_both_feet_share_contact_state(self) -> None:
     self.command[:, 0] = 0.2
