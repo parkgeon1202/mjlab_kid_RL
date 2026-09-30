@@ -44,7 +44,7 @@ from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_dance_constants import (
 )
 from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotation,
-  default_joint_pose_deviation,
+  default_joint_pose_exp,
   airborne_foot_arm_swing_reward,
   feet_distance_penalty,
   base_height_penalty,
@@ -55,7 +55,11 @@ from mjlab_kid_rl.tasks.mdp import (
   forward_step_reward,
   gait_phase,
   gait_phase_contact_reward,
+  imu_gyro_lowpass,
+  joint_vel_window_avg,
+  randomize_bam_kp,
   gait_phase_swing_clearance_reward,
+  swing_progress_reward,
   gait_symmetry_reward,
   velocity_shortfall_penalty,
   relative_angular_velocity_error_penalty,
@@ -427,6 +431,13 @@ VIEWER_CONFIG = ViewerConfig(
 # in hardware and redundant. Leaves the 25 actuated joints.
 DOFS_FILTER = r"^(?!.*_(?:cap|actual)$).*$"
 
+USE_GAIT_PHASE = False
+"""보행 위상(gait_phase) 관측과 위상 보상(gait_phase_contact, gait_phase_swing_clearance) 사용 여부.
+2026-09-30 재학습부터 끈다. 실기 컨트롤러는 모델 메타데이터로 84/86 차원을 자동 판별한다."""
+
+IMU_GYRO_FILTER_HZ = 6.0
+"""actor gyro 관측 저역통과 컷오프. deploy_ws kid_rl controllers.yaml imu_gyro_filter_hz 와 같아야 한다."""
+
 _DEFAULT_FOOT_SEPARATION = 0.13425
 """Horizontal distance between the two foot sites in HOME_KEYFRAME [m].
 
@@ -486,6 +497,7 @@ class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
       "dof_actual_armature_randomization",
       "dof_cap_friction_randomization",
       "dof_actual_friction_randomization",
+      "bam_kp_randomization",
     ):
       self.events.pop(event_name, None)
 
@@ -672,9 +684,18 @@ def make_kid_rl_velocity_env_cfg(
     # 매 스텝 지연을 새로 뽑을 차례지만 80% 는 지금 지연을 유지한다(2026-09-23).
     delay_hold_prob=0.8,
   )
+  # 2026-09-28: 실기 Dynamixel 속도 레지스터는 순간 속도가 아니라 약 60 ms 구간 평균
+  # 속도다(위치 차분 대비 전 관절 30 ms 지연, 2/5/12.5 Hz 에서 0.95/0.82/0.30 배 --
+  # 60 ms 평균의 이론값 0.98/0.86/0.30 과 일치. deploy_ws kid_rl/docs/
+  # SIM2REAL_OSCILLATION_2026-09-28.md). 학습도 같은 신호를 보도록 순간 속도 대신
+  # (q(now) - q(now - 60 ms)) / 60 ms 를 넣는다. 읽기(버스) 지연은 아래 delay 로 따로 둔다.
+  # critic 은 참값(joint_vel_rel)을 그대로 쓴다.
   cfg.observations["actor"].terms["joint_vel"] = ObservationTermCfg(
-    func=mdp.joint_vel_rel,
-    params={"asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,))},
+    func=joint_vel_window_avg,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
+      "window_s": 0.06,
+    },
     noise=Unoise(n_min=-0.125, n_max=0.125),
     delay_min_lag=0,
     delay_max_lag=2 if DR_WIDE else 1,
@@ -708,6 +729,24 @@ def make_kid_rl_velocity_env_cfg(
     term.delay_hold_prob = 0.8
     cfg.observations["actor"].terms[term_name] = term
 
+  # 2026-09-28: actor gyro 를 실기 컨트롤러와 같은 1차 저역통과(6 Hz)로 거른다
+  # (deploy_ws kid_rl imu_gyro_filter_hz, include/kid_rl/lowpass.hpp). 실기에서 10-15 Hz
+  # 몸 떨림이 gyro -> 정책 -> 다리로 되먹임되어 발진했고, 컨트롤러에서만 거르자 학습에 없던
+  # 약 27 ms 지연 때문에 6-8 Hz 발진으로 옮겨갔다. 학습도 같은 필터를 봐야 한다.
+  # 노이즈·지연은 위에서 정한 그대로 필터 뒤에 붙는다. critic 은 참값.
+  _gyro = cfg.observations["actor"].terms["base_ang_vel"]
+  assert _gyro.params.get("sensor_name") == "robot/imu_ang_vel", _gyro.params
+  _gyro.func = imu_gyro_lowpass
+  # 2026-09-30: 센서 잡음은 필터 앞에서 넣는다(실기: 센서 잡음 -> 6 Hz 필터 -> 정책). 관측
+  # 매니저 noise 는 func 뒤에 붙어 필터를 안 거친 백색잡음이 되므로 끈다. 크기는 그대로 ±0.06.
+  _gyro.params = {
+    "sensor_name": "robot/imu_ang_vel",
+    "cutoff_hz": IMU_GYRO_FILTER_HZ,
+    "noise": 0.06,
+    "corruption_group": "actor",
+  }
+  _gyro.noise = None
+
   # Gait clock. See gait_phase's docstring for why a limit cycle needs an
   # external rhythm rather than more penalties on standing. Fixed, not
   # randomised: see the docstring for why.
@@ -725,17 +764,18 @@ def make_kid_rl_velocity_env_cfg(
   _GAIT_SWING_TIME = 0.4
   _GAIT_SWING_FRACTION = 0.5 - np.arcsin(_GAIT_DOUBLE_SUPPORT_BAND) / np.pi
   _GAIT_CYCLE_TIME = float(_GAIT_SWING_TIME / _GAIT_SWING_FRACTION)
-  for _group in ("actor", "critic"):
-    cfg.observations[_group].terms["gait_phase"] = ObservationTermCfg(
-      func=gait_phase,
-      params={"cycle_time": _GAIT_CYCLE_TIME},
-    )
+  if USE_GAIT_PHASE:
+    for _group in ("actor", "critic"):
+      cfg.observations[_group].terms["gait_phase"] = ObservationTermCfg(
+        func=gait_phase,
+        params={"cycle_time": _GAIT_CYCLE_TIME},
+      )
 
   # ---------------------------- Rewards ---------------------------
   # Reuse one velocity-command cutoff for upright target selection, pose,
   # foot clearance, air time, and foot slip.
   walking_threshold = 0.01
-  max_swing_time = 0.5
+  max_swing_time = 0.7
 
   # Track commanded velocity continuously with mjlab's built-in rewards.
   cfg.rewards["track_linear_velocity"].func = mdp.track_linear_velocity
@@ -835,11 +875,11 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["pose"].params["running_threshold"] = running_threshold
   cfg.rewards["pose"].weight = 1.0
 
-  # Penalize squared joint deviation from HOME_KEYFRAME during stand commands.
+  # Reward proximity to HOME_KEYFRAME during stand commands.
   # The target comes from robot.data.default_joint_pos; walking is unaffected.
   cfg.rewards["default_joint_pose"] = RewardTermCfg(
-    func=default_joint_pose_deviation,
-    weight=-3.0,
+    func=default_joint_pose_exp,
+    weight=1.0,
     params={
       "std": 0.15,
       "command_name": "twist",
@@ -882,12 +922,12 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["air_time"].func = feet_air_time_continuous_reward
   cfg.rewards["air_time"].params = {
     "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-    "threshold_min": 0.2,
-    "threshold_max": max_swing_time-0.1,
+    "threshold_min": 0.3,
+    "threshold_max": max_swing_time,
     "command_name": "twist",
     "command_threshold": walking_threshold,
   }
-  # Pay every step while exactly one foot has been airborne for 0.2--0.5 s.
+  # Pay every step while exactly one foot has been airborne for 0.3--0.7 s.
   # Landing and overlong swings receive no air-time reward.
   cfg.rewards["air_time"].weight = 1.0
 
@@ -940,8 +980,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["overlong_swing"] = RewardTermCfg(
     func=overlong_swing_penalty,
-    # Effective cost is -0.04 per 50 Hz step after 0.6 s. At the same instant
-    # the tracking/upright gate closes, so landing is better than waiting.
+    # Penalize air time after the 0.7 s reward window closes.
     weight=-2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
@@ -971,12 +1010,12 @@ def make_kid_rl_velocity_env_cfg(
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
   cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
-  cfg.rewards["action_rate_l2"].weight = -0.6
+  cfg.rewards["action_rate_l2"].weight = -0.1
   cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
     func=self_collision_cost_excluding_linkage,
-    weight=-1.0,
+    weight=-8.0,
     params={
       "sensor_name": SELF_COLLISION_SENSOR_CFG.name,
       "linkage_sensor_names": tuple(c.name for c in LINKAGE_CONTACT_SENSOR_CFGS),
@@ -1070,7 +1109,7 @@ def make_kid_rl_velocity_env_cfg(
   # largest positive term (track_linear_velocity, weight 2.0) contributes 0.04.
   cfg.rewards["termination"] = RewardTermCfg(
     func=envs_mdp.is_terminated,
-    weight=-400.0,
+    weight=-200.0,
     params={},
   )
   # air_time pays each foot out independently, so hopping twice on one leg
@@ -1092,30 +1131,48 @@ def make_kid_rl_velocity_env_cfg(
   # says the same thing far more bluntly and is the weight that turned
   # standing into falling; consider dropping it back toward -1 so the clock,
   # not the penalty, is what shapes alternation.
-  cfg.rewards["gait_phase_contact"] = RewardTermCfg(
-    func=gait_phase_contact_reward,
+  # 2026-09-30: 위상 보상 두 개는 gait_phase 관측이 만드는 시계를 읽으므로 USE_GAIT_PHASE 일 때만
+  # 정의한다(시계가 없으면 assert 로 멈추고, 위상을 못 보는 정책은 위상 맞춤 보상을 배울 수 없다).
+  if USE_GAIT_PHASE:
+    cfg.rewards["gait_phase_contact"] = RewardTermCfg(
+      func=gait_phase_contact_reward,
+      weight=0.5,
+      params={
+        "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+        "command_name": "twist",
+        "command_threshold": walking_threshold,
+        "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
+      },
+    )
+
+    # Give immediate progress toward the clock-selected swing, before the
+    # one-off 2 cm crossing reward and 0.2 s air-time reward can activate.
+    cfg.rewards["gait_phase_swing_clearance"] = RewardTermCfg(
+      func=gait_phase_swing_clearance_reward,
+      weight=0.0,
+      params={
+        "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+        "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+        "command_name": "twist",
+        "command_threshold": walking_threshold,
+        "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
+        "min_height": 0.005,
+        "target_height": 0.02,
+      },
+    )
+
+  # Reward current one-foot swing clearance from 5 mm to 2 cm on each step.
+  # No phase clock or double-support band is used.
+  cfg.rewards["swing_progress"] = RewardTermCfg(
+    func=swing_progress_reward,
     weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-      "command_name": "twist",
-      "command_threshold": walking_threshold,
-      "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
-    },
-  )
-
-  # Give immediate progress toward the clock-selected swing, before the
-  # one-off 2 cm crossing reward and 0.2 s air-time reward can activate.
-  cfg.rewards["gait_phase_swing_clearance"] = RewardTermCfg(
-    func=gait_phase_swing_clearance_reward,
-    weight=0.0,
-    params={
-      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-      "command_name": "twist",
-      "command_threshold": walking_threshold,
-      "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
       "min_height": 0.005,
       "target_height": 0.02,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
     },
   )
 
@@ -1143,7 +1200,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=1.5,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1177,7 +1234,7 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-2.0,
+    weight=-5.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
@@ -1248,7 +1305,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["foot_base_heading_error"] = RewardTermCfg(
     func=foot_base_heading_error_penalty,
-    weight=-0.5,
+    weight=-1.0,
     params={
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
     },
@@ -1287,18 +1344,16 @@ def make_kid_rl_velocity_env_cfg(
   # Match the 20 s episode horizon: reset samples one fresh command and the
   # timeout resets the environment before an in-episode resample can occur.
   # Both bounds are required; ``(20.0)`` would be a float, not a one-item tuple.
-  command.resampling_time_range = (5.0, 20.0)
+  command.resampling_time_range = (15.0, 20.0)
   command.rel_standing_envs = 0.1
   command.rel_heading_envs = 0.0
   command.rel_rotation_envs = 0.1
-  # Single-purpose commands, exclusive with rotation (see
-  # UniformVelocityCommandWithRotation). Rotation and the three single-axis
-  # modes take 40%; diagonal planar translation (vx/vy nonzero, wz=0) takes
-  # another 20%. Standing takes 10%, and the remaining 30% keep the mixed
-  # vx/vy/wz sample.
+  # Exclusive fractions of all environments: standing/rotation/forward/backward
+  # each take 10%, lateral-only and diagonal planar translation each take 30%.
+  # These sum to 100%, leaving no mixed vx/vy/wz commands during training.
   command.rel_forward_only_envs = 0.1
   command.rel_backward_only_envs = 0.1
-  command.rel_lateral_only_envs = 0.2
+  command.rel_lateral_only_envs = 0.3
   command.rel_planar_only_envs = 0.3
   command.directional_min_lin_vel = 0.05
   # Use this task's explicit forward-only sampler instead of the template's
@@ -1463,6 +1518,35 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
+  # 2026-09-29: BAM 펌웨어 kp 를 모터 그룹마다 env 별로 흔든다 (BamActuator.set_gains).
+  # duty = kp * error_gain * error 라 kp 배율은 error_gain 오차도 같이 덮는다.
+  # 실기 로그를 같은 target 으로 sim 에 재생한 비교(deploy_ws kid_rl/docs/
+  # SIM2REAL_OSCILLATION_2026-09-28.md):
+  #   - MX-106 (hip/ankle roll): 땅에서 하중을 받으면 sim 이 덜 따라감 (오른 hip roll 43% vs
+  #     실기 71%, ankle 23% vs 63%). 파라미터가 프로토콜 1.0 에서 식별됐고 1.0->2.0 duty 환산이
+  #     약 2배 어긋나 있어 1.0~2.0 로 넓게 잡는다.
+  #   - XH540 (다리 pitch): KP divisor 가 데이터시트 128 그대로(같은 2.0 계열 MX-64/106 은 실측
+  #     141/147) -- 강한 쪽으로 1.0~1.3.
+  #   - MX-64 (torso/hip yaw): 실기가 sim 보다 덜 움직임(느린 동작 추종비 0.15 vs 0.30) --
+  #     약한 쪽을 포함해 0.7~1.1.
+  #   - MX-28 (팔/목): 비교 근거 없음, 0.9~1.2.
+  cfg.events["bam_kp_randomization"] = EventTermCfg(
+    mode="startup",
+    func=randomize_bam_kp,
+    params={
+      "asset_cfg": SceneEntityCfg("robot"),
+      # 2026-09-30: 위 비대칭 범위의 근거("sim 이 하중에 약함")는 BAM motor 변환 후 남은
+      # ctrlrange(관절 각도 범위)가 토크를 1~2 Nm 로 자르던 버그였다. 수정 후에는 같은 target
+      # 에 대한 roll 추종이 실기와 비슷하므로 모든 모터를 기준 kp(27/46/102/149) 대비 0.8~1.2 로.
+      "kp_scale_ranges": {
+        "mx106v2": (0.8, 1.2),
+        "xh": (0.8, 1.2),
+        "mx64v2": (0.8, 1.2),
+        "mx28": (0.8, 1.2),
+      },
+    },
+  )
+
   # BAM writes per-environment dof_frictionloss/dof_damping, which requires those
   # model fields to be expanded per world before stepping.
   cfg.events["bam_init"] = EventTermCfg(func=bam_init, mode="startup")
@@ -1499,11 +1583,11 @@ def make_kid_rl_velocity_env_cfg(
         threshold_start=0.23,
         threshold_end=3.0,
         push_full_scale={
-          "x": 0.3,
-          "y": 0.3,
-          "roll": 0.32,
-          "pitch": 0.32,
-          "yaw": 0.32,
+          "x": 0.5,
+          "y": 0.5,
+          "roll": 0.52,
+          "pitch": 0.52,
+          "yaw": 0.52,
         },
       ),
     },
@@ -1547,6 +1631,16 @@ def make_kid_rl_velocity_env_cfg(
 # classic legged-robot setups that size was designed for, so it's neither over- nor
 # under-sized here. Revisit empirically (via ablation) if training is slow/unstable,
 # not by recomputing from observation size.
+# CAPS coefficients are starting values, not validated real-robot tuning.
+CAPS_SPATIAL_COEF = 0.1
+CAPS_TEMPORAL_COEF = 0.03
+CAPS_GYRO_STD = 0.3  # rad/s, before actor observation normalization
+CAPS_JOINT_VEL_STD = 0.3
+"""CAPS 공간 외란: actor joint_vel 칸(rad/s, 정규화 전). 2026-09-29 실기 분석에서 CAPS 로 gyro 민감도가
+1/25 로 줄자 joint_vel 이 남은 주 되먹임 경로였다(칸당·정규화 1 std 당 민감도가 gyro 의 약 2.6배).
+학습 정규화 std 평균 0.60 이라 0.3 은 약 0.5 std -- gyro(0.3 = 약 1 std)보다 약하게 흔든다."""
+
+
 @dataclass
 class KidRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   """mjlab's PPO config plus RSL-RL's symmetry extension.
@@ -1558,6 +1652,8 @@ class KidRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   """
 
   symmetry_cfg: dict | None = None
+  smooth_cfg: dict | None = None
+  """CAPS 공간·시간 손실 설정. mjlab_kid_rl.tasks.smooth_ppo 참고."""
 
 
 KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
@@ -1600,6 +1696,16 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     # pi(mirror(obs)) ~= mirror(pi(obs)); it does not impose a half-cycle gait.
     # Keep the coefficient small so it regularizes left/right responses without
     # overwhelming the asymmetric action needed to initiate a swing.
+    # 2026-09-28: gyro 가 조금 변할 때 action 이 크게 변하지 않도록 벌한다(smooth_ppo.py).
+    # CAPS 공간(gyro 외란)·시간(실제 연속 관측) 손실을 함께 적용한다.
+    # slices 는 actor 관측의 base_ang_vel 칸(0:3, 첫 항목) -- 관측 순서를 바꾸면 같이 바꿀 것.
+    class_name="mjlab_kid_rl.tasks.smooth_ppo:SmoothPPO",
+    smooth_cfg={
+      "spatial_coef": CAPS_SPATIAL_COEF,
+      "temporal_coef": CAPS_TEMPORAL_COEF,
+      # actor 관측 칸: base_ang_vel 0:3, joint_vel 31:56 (관측 순서를 바꾸면 같이 바꿀 것)
+      "slices": [(0, 3, CAPS_GYRO_STD), (31, 56, CAPS_JOINT_VEL_STD)],
+    },
     symmetry_cfg={
       "use_data_augmentation": False,
       "use_mirror_loss": False,
@@ -1613,6 +1719,8 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
   num_steps_per_env=24,
   # Bound the raw policy action before it enters the environment or the
   # last-action observation, preventing the unbounded feedback seen in long runs.
-  clip_actions=5.0,
+  # 2026-09-30: action clip 제거 (None = 자르지 않음). 실기 controllers.yaml action_clip 도 0 으로
+  # 맞춰야 한다 -- last_action 관측이 학습과 같은 (자르지 않은) 값이어야 한다.
+  clip_actions=None,
   max_iterations=15_000,
 )

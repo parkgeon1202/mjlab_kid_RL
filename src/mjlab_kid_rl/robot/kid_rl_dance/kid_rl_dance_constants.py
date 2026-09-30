@@ -110,7 +110,7 @@ MX28_ACTUATOR = BamActuatorCfg(
     r"^(left|right)_(shoulder_pitch|shoulder_roll|shoulder_yaw|elbow_pitch|wrist_pitch)$",
     r"^(neck_yaw|head_pitch)$",
   ),
-  kp_fw=35,
+  kp_fw=27,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
@@ -127,7 +127,7 @@ MX64V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
   target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
-  kp_fw=60,
+  kp_fw=46,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
@@ -142,7 +142,7 @@ MX106V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx106v2",
   model="m5",
   target_names_expr=(r"^(left|right)_(hip|ankle)_roll_crank$",),
-  kp_fw=134,
+  kp_fw=102,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
@@ -157,7 +157,7 @@ XH540_ACTUATOR = BamActuatorCfg(
   motor_name="xh540",
   model="m5",
   target_names_expr=(r"^(left|right)_(hip_pitch|knee_pitch|ankle_pitch)$",),
-  kp_fw=165,
+  kp_fw=149,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
@@ -216,9 +216,9 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
 # specifies (no mixing).
 _FOOT_PATTERN = r".*_foot_collision_.*"
 
-# Invisible 15 mm extensions on only the inward face of each foot. Collision
-# bit 32 is private to this pair, so they warn the policy about foot-to-foot
-# clearance without touching the terrain or any other robot geometry.
+# Invisible 5 mm extensions on only the inward face of each foot. Private
+# collision bit 32 lets the two proxies contact each other without touching
+# terrain or other robot geoms.
 _FOOT_INNER_SAFETY_PATTERN = r"^(left|right)_foot_inner_safety$"
 
 # Hip/ankle parallel-linkage self-contact geoms (groove walls, roll caps). These
