@@ -251,18 +251,17 @@ class UniformVelocityCommandWithRotationCfg(UniformVelocityCommandCfg):
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
-def default_joint_pose_deviation(
+def default_joint_pose_exp(
     env: ManagerBasedRlEnv,
     std: float,
     command_name: str,
     walking_threshold: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Return squared deviation from HOME_KEYFRAME during a stand command.
+    """Reward proximity to HOME_KEYFRAME during a stand command.
 
-    The robot's ``default_joint_pos`` comes from ``HOME_KEYFRAME``. The
-    penalty is zero at that pose, grows as ``mean(error**2) / std**2``, and
-    is zero for walking commands so it does not resist stepping.
+    Return ``exp(-mean(error**2) / std**2)``: one at the default pose,
+    decreasing toward zero as joint deviation grows. Walking commands score zero.
     """
     asset: Entity = env.scene[asset_cfg.name]
     default_joint_pos = asset.data.default_joint_pos
@@ -276,7 +275,7 @@ def default_joint_pose_deviation(
     joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
     target_joint_pos = default_joint_pos[:, asset_cfg.joint_ids]
     mean_squared_error = torch.mean(torch.square(joint_pos - target_joint_pos), dim=1)
-    return mean_squared_error / std**2 * below_walking_threshold.float()
+    return torch.exp(-mean_squared_error / std**2) * below_walking_threshold.float()
 
 
 def settled_standing_penalty(
@@ -1142,6 +1141,200 @@ class gait_phase:
         return torch.stack([torch.sin(angle), torch.cos(angle)], dim=-1)
 
 
+class joint_vel_window_avg:
+    """Joint velocity as the Dynamixel present-velocity register reports it.
+
+    Observation = (q(now) - q(now - window_s)) / window_s, i.e. the average
+    joint velocity over the last ``window_s`` seconds, instead of the
+    instantaneous velocity.
+
+    Why (2026-09-28, deploy_ws kid_rl sim2real analysis, air run + run2): on the
+    real robot the present-velocity register lags the position-derived velocity
+    by ~30 ms on every joint (corr 0.98) and attenuates fast motion -- 0.95 /
+    0.82 / ~0.30 of the true velocity at 2 / 5 / 12.5 Hz. A 60 ms window
+    average predicts exactly that (half-window lag 30 ms; gain
+    sin(pi f T)/(pi f T) = 0.98 / 0.86 / 0.30). The policy trained on the true
+    velocity therefore saw a joint_vel on hardware that was both older and
+    smoother than anything in training.
+
+    window_s must be a whole number of control steps: positions are sampled
+    once per control step (at observation time), and with window_s = n *
+    step_dt the difference of the samples n steps apart is exactly the
+    average velocity over the window (it is the integral of the velocity).
+
+    Bus/read latency (the few ms between the servo latching the value and the
+    policy using it) is *not* modelled here -- that stays in the term's
+    delay_min_lag/delay_max_lag, applied after this function.
+
+    On reset the window is filled with the post-reset position, so the first
+    observations of an episode report the motion since the reset (0 at the
+    first). On hardware the policy starts from a held pose, where the register
+    also reads ~0.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        window_s = float(cfg.params["window_s"])
+        n = round(window_s / env.step_dt)
+        if n < 1 or abs(n * env.step_dt - window_s) > 1e-6:
+            raise ValueError(
+                f"window_s={window_s} must be a positive multiple of step_dt={env.step_dt}"
+            )
+        self._n = n
+        self._window_s = n * env.step_dt
+        asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+        self._asset = asset
+        self._joint_ids = cfg.params["asset_cfg"].joint_ids
+        q = asset.data.joint_pos[:, self._joint_ids]
+        # _hist[:, 0] = oldest (now - window), _hist[:, n] = now.
+        self._hist = q.unsqueeze(1).repeat(1, n + 1, 1).clone()
+        self._pending = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        self._last_step = -1
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        # The reset pose may not be written yet when the manager resets; fill
+        # the window at the next call instead.
+        if env_ids is None:
+            self._pending[:] = True
+        else:
+            self._pending[env_ids] = True
+
+    def __call__(
+        self, env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, window_s: float
+    ) -> torch.Tensor:
+        del asset_cfg, window_s  # Read once in __init__.
+        q = self._asset.data.joint_pos[:, self._joint_ids]
+        # One sample per control step, even if called more than once in a step.
+        if env.common_step_counter != self._last_step:
+            self._last_step = env.common_step_counter
+            self._hist = torch.roll(self._hist, shifts=-1, dims=1)
+            self._hist[:, -1] = q
+        if self._pending.any():
+            ids = self._pending.nonzero(as_tuple=True)[0]
+            self._hist[ids] = q[ids].unsqueeze(1)
+            self._pending[ids] = False
+        return (self._hist[:, -1] - self._hist[:, 0]) / self._window_s
+
+
+def _bam_actuators(asset: Entity) -> list:
+    """BamActuator instances of an entity (unwrapping delay wrappers if any)."""
+    found = []
+    for act in asset.actuators:
+        seen, stack = set(), [act]
+        while stack:
+            a = stack.pop()
+            if id(a) in seen:
+                continue
+            seen.add(id(a))
+            if type(a).__name__ == "BamActuator":
+                found.append(a)
+                break
+            stack.extend(
+                v for k, v in vars(a).items()
+                if not k.startswith("__") and hasattr(v, "__dict__")
+                and type(v).__module__.startswith(("bam", "mjlab"))
+            )
+    return found
+
+
+def randomize_bam_kp(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    kp_scale_ranges: dict[str, tuple[float, float]],
+) -> None:
+    """Per-env firmware kp scale for each BAM motor group.
+
+    kp_scale_ranges maps a BAM actuator class-name prefix (lower case, e.g.
+    "mx106v2", "xh", "mx64v2", "mx28") to a uniform (low, high) range. BAM's
+    duty cycle is kp * error_gain * error, so this also covers an error_gain
+    (protocol / KP divisor) error of the same factor. Every motor group of the
+    robot must be matched, so a renamed model cannot silently go unrandomized.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    bams = _bam_actuators(asset)
+    if not bams:
+        raise RuntimeError("randomize_bam_kp: no BamActuator found")
+    ids = slice(None) if env_ids is None else env_ids
+    n = env.num_envs if env_ids is None else len(env_ids)
+    for b in bams:
+        cls = type(b._bam_model.actuator).__name__.lower()
+        key = next((k for k in kp_scale_ranges if cls.startswith(k)), None)
+        if key is None:
+            raise RuntimeError(f"randomize_bam_kp: no kp range for BAM actuator {cls}")
+        k = torch.empty(n, 1, device=env.device).uniform_(*kp_scale_ranges[key])
+        b.set_gains(ids, kp_scale=k)
+        b.default_kp_scale[ids] = k
+
+
+class imu_gyro_lowpass:
+    """IMU angular velocity through the same 1st-order low-pass as the real controller.
+
+    Matches deploy_ws kid_rl include/kid_rl/lowpass.hpp, applied once per control
+    step:
+        alpha = dt / (dt + 1 / (2 pi cutoff_hz))
+        y[k]  = y[k-1] + alpha * (x[k] - y[k-1])
+
+    Why (2026-09-28): the real gyro carries a 10-15 Hz body vibration that the
+    policy fed back into itself. The controller now low-passes the gyro
+    observation (imu_gyro_filter_hz, 6 Hz); training must see the same filtered
+    signal and its ~27 ms effective age, or the deployed policy runs with a lag it
+    never learned (on hardware that moved the oscillation to 6-8 Hz instead of
+    removing it).
+
+    Sensor noise: on the robot the gyro's own noise goes through the filter, so
+    it is added here, *before* filtering (uniform in [-noise, noise] per axis,
+    drawn once per control step) -- set the term's own ``noise`` to None or it
+    is added a second time, unfiltered, by the observation manager. The noise is
+    applied only while ``corruption_group``'s enable_corruption is on, so play /
+    no-randomization configs (which turn corruption off) get a clean gyro.
+    A delay configured on the term is still applied by the manager after this
+    function, which matches the robot (the filtered sample is what arrives late).
+    On reset the filter restarts from the current reading, like the controller
+    at startup.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        cutoff_hz = float(cfg.params["cutoff_hz"])
+        if cutoff_hz <= 0.0:
+            raise ValueError("cutoff_hz must be > 0 (use builtin_sensor for no filter)")
+        dt = env.step_dt
+        self._alpha = dt / (dt + 1.0 / (2.0 * math.pi * cutoff_hz))
+        self._sensor = env.scene[cfg.params["sensor_name"]]
+        group = cfg.params.get("corruption_group", "actor")
+        corrupt = bool(env.cfg.observations[group].enable_corruption)
+        self._noise = float(cfg.params.get("noise", 0.0)) if corrupt else 0.0
+        if cfg.noise is not None and self._noise > 0.0:
+            raise ValueError("imu_gyro_lowpass adds the sensor noise itself; set the term's noise=None")
+        x = self._sensor.data
+        self._y = x.clone()
+        self._pending = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        self._last_step = -1
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None:
+            self._pending[:] = True
+        else:
+            self._pending[env_ids] = True
+
+    def __call__(
+        self, env: ManagerBasedRlEnv, sensor_name: str, cutoff_hz: float,
+        noise: float = 0.0, corruption_group: str = "actor",
+    ) -> torch.Tensor:
+        del sensor_name, cutoff_hz, noise, corruption_group  # Read once in __init__.
+        new_step = env.common_step_counter != self._last_step
+        x = self._sensor.data
+        if self._noise > 0.0 and (new_step or self._pending.any()):
+            x = x + (torch.rand_like(x) * 2.0 - 1.0) * self._noise
+        if new_step:
+            self._last_step = env.common_step_counter
+            self._y = self._y + self._alpha * (x - self._y)
+        if self._pending.any():
+            ids = self._pending.nonzero(as_tuple=True)[0]
+            self._y[ids] = x[ids]
+            self._pending[ids] = False
+        return self._y.clone()
+
+
 def gait_phase_contact_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str,
@@ -1297,8 +1490,8 @@ def no_stepping_penalty(
 def feet_air_time_continuous_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str,
-    threshold_min: float = 0.2,
-    threshold_max: float = 0.5,
+    threshold_min: float = 0.3,
+    threshold_max: float = 0.7,
     command_name: str = "twist",
     command_threshold: float = 0.01,
 ) -> torch.Tensor:
@@ -1463,67 +1656,40 @@ def swing_progress_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str,
     height_sensor_name: str,
-    target_height: float = 0.03,
+    min_height: float = 0.005,
+    target_height: float = 0.02,
     command_name: str = "twist",
     command_threshold: float = 0.01,
 ) -> torch.Tensor:
-    """Dense, graded reward for getting a foot off the ground at all.
+    """Reward current swing-foot clearance without a gait phase or band.
 
-    Every other stepping term in this task pays nothing until a *complete*
-    step has happened: forward_step needs a landing that cleared both 2 cm of
-    height and 2 cm of distance, feet_crossing needs 3 cm of swing height,
-    air_time needs 0.3 s airborne. Between "both feet planted" and "a full
-    step" the reward is therefore flat -- and not_stepping_penalty, being a
-    constant -0.3 whenever both feet are down, does not break that tie either:
-    it lowers the value of standing uniformly without saying which direction
-    gets out of it. A policy that has never completed a step sees no gradient
-    toward one and can only find it by chance, against the termination penalty
-    if the attempt tips the robot over.
-
-    This term fills that gap. It pays out in proportion to how far the highest
-    airborne foot has risen, saturating at target_height, so lifting a foot 5
-    mm already scores better than not lifting it, 1 cm better still, and the
-    gradient runs continuously into the region where the gated terms take
-    over.
-
-    The maximum over feet -- not the sum -- is deliberate: rewarding both feet
-    at once would pay for a two-footed hop. Taking only the highest foot means
-    the best a robot can do is get one foot up, which is single support, which
-    is walking.
-
-    Contact is required as well as height: a foot resting on a ledge reads a
-    nonzero terrain clearance while still being stood on, and should not count
-    as a swing.
-
-    Args:
-        sensor_name: Foot/ground contact sensor, slots matching the height
-            sensor's feet.
-        height_sensor_name: Terrain height sensor giving per-foot ground
-            clearance.
-        target_height: Clearance at which this term saturates, in metres.
-            Sits at/below the swing-height gates of the terms that take over
-            (feet_crossing's 3 cm) so the hand-off is continuous.
-        command_name: Velocity command to gate on.
-        command_threshold: Below this commanded speed the term is off -- a
-            robot asked to stand still should keep both feet down.
+    The opposite foot must stay planted, and the selected swing foot must be
+    airborne. Clearance pays linearly from min_height to target_height on each
+    step; lowering the foot reduces the reward but never makes it negative.
     """
+    if target_height <= min_height:
+        raise ValueError("target_height must be greater than min_height")
+
     sensor: ContactSensor = env.scene[sensor_name]
     found = sensor.data.found
+    assert found is not None
     if found.dim() == 3:
         found = found.any(dim=-1)
-    in_air = ~found.bool()  # [B, F]
+    contact = found.bool()  # [B, 2] (left, right)
+    heights = env.scene[height_sensor_name].data.heights
+    progress = ((heights - min_height) / (target_height - min_height)).clamp(0.0, 1.0)
 
-    height_sensor = env.scene[height_sensor_name]
-    heights = height_sensor.data.heights  # [B, F]
-
-    progress = torch.clamp(heights, min=0.0, max=target_height) / target_height
-    reward = (progress * in_air.float()).max(dim=-1).values  # [B]
+    right_swing = contact[:, 0] & ~contact[:, 1]
+    left_swing = contact[:, 1] & ~contact[:, 0]
+    reward = (
+        progress[:, 1] * right_swing.float()
+        + progress[:, 0] * left_swing.float()
+    )
 
     command = env.command_manager.get_command(command_name)
-    if command is not None:
-        speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
-        reward = reward * (speed > command_threshold).float()
-    return reward
+    assert command is not None
+    speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
+    return reward * (speed > command_threshold).float()
 
 
 def base_height_penalty(
