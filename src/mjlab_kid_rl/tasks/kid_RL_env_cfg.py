@@ -50,8 +50,10 @@ from mjlab_kid_rl.tasks.mdp import (
   base_height_penalty,
   feet_crossing_reward,
   foot_flatness_penalty,
+  foot_landing_alignment_reward,
   flatness_weighted_foot_slip_penalty,
   feet_air_time_continuous_reward,
+  both_feet_airborne_penalty,
   forward_step_reward,
   gait_phase,
   gait_phase_contact_reward,
@@ -909,7 +911,7 @@ def make_kid_rl_velocity_env_cfg(
   # Target swing height scaled to this robot: ~0.476 m tall with ~0.14 m shins,
   # vs the template's 0.1 m default sized for a ~1.3 m humanoid.
   cfg.rewards["foot_clearance"].params["command_threshold"] = walking_threshold
-  cfg.rewards["foot_clearance"].params["target_height"] = 0.02
+  cfg.rewards["foot_clearance"].params["target_height"] = 0.03
   # This is not a positive "lift the foot" reward. Its cost is
   # |height - target| * foot_xy_speed, so it teaches an already-moving swing
   # foot to travel near 3 cm clearance. The one-shot feet_crossing term below
@@ -929,7 +931,17 @@ def make_kid_rl_velocity_env_cfg(
   }
   # Pay every step while exactly one foot has been airborne for 0.3--0.7 s.
   # Landing and overlong swings receive no air-time reward.
-  cfg.rewards["air_time"].weight = 1.0
+  cfg.rewards["air_time"].weight = 5.0
+  cfg.rewards["both_feet_airborne"] = RewardTermCfg(
+    func=both_feet_airborne_penalty,
+    weight=-3.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "min_air_time_s": 0.06,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+    },
+  )
 
   cfg.rewards["no_stepping"] = RewardTermCfg(
     func=no_stepping_penalty,
@@ -1146,7 +1158,7 @@ def make_kid_rl_velocity_env_cfg(
     )
 
     # Give immediate progress toward the clock-selected swing, before the
-    # one-off 2 cm crossing reward and 0.2 s air-time reward can activate.
+    # one-off 3 cm crossing reward and 0.2 s air-time reward can activate.
     cfg.rewards["gait_phase_swing_clearance"] = RewardTermCfg(
       func=gait_phase_swing_clearance_reward,
       weight=0.0,
@@ -1157,28 +1169,30 @@ def make_kid_rl_velocity_env_cfg(
         "command_threshold": walking_threshold,
         "double_support_band": _GAIT_DOUBLE_SUPPORT_BAND,
         "min_height": 0.005,
-        "target_height": 0.02,
+        "target_height": 0.03,
       },
     )
 
-  # Reward current one-foot swing clearance from 5 mm to 2 cm on each step.
-  # No phase clock or double-support band is used.
+  # Pay only for new lift height, then once for a matched alternating pair
+  # of landed swings. Holding one foot up does not pay each step.
   cfg.rewards["swing_progress"] = RewardTermCfg(
     func=swing_progress_reward,
-    weight=0.5,
+    weight=5.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
       "min_height": 0.005,
-      "target_height": 0.02,
+      "target_height": 0.03,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      "height_std": 0.01,
+      "pair_bonus_scale": 5.0,
     },
   )
 
   cfg.rewards["same_foot_repeat"] = RewardTermCfg(
     func=same_foot_repeat_penalty,
-    weight=-0.0,
+    weight=-10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1200,7 +1214,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=2.0,
+    weight=4.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1212,6 +1226,7 @@ def make_kid_rl_velocity_env_cfg(
       # std) each read as "clearly limping".
       "duration_std": 0.1,
       "length_std": 0.05,
+      "min_double_air_time_s": 0.06,
     },
   )
 
@@ -1234,25 +1249,38 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-5.0,
+    weight=-3.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
     },
   )
 
-  # Pay once per swing when a foot first clears 2 cm; rearm on landing.
-  # Keep the one-off bonus when the next qualifying foot is the opposite one.
-  cfg.rewards["feet_crossing"] = RewardTermCfg(
-    func=feet_crossing_reward,
-    weight=1.0,
+  # Reward sole alignment with the actual terrain normal only on landing.
+  cfg.rewards["foot_landing_alignment"] = RewardTermCfg(
+    func=foot_landing_alignment_reward,
+    weight=3.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-      "min_swing_height": 0.02,
+      "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
+      "min_double_air_time_s": 0.06,
+    },
+  )
+
+  # Pay once per swing when a foot first clears 3 cm; rearm on landing.
+  # Keep the one-off bonus when the next qualifying foot is the opposite one.
+  cfg.rewards["feet_crossing"] = RewardTermCfg(
+    func=feet_crossing_reward,
+    weight=5.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+      "min_swing_height": 0.03,
       "alternation_bonus": 1.0,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      "min_double_air_time_s": 0.06,
     },
   )
 
@@ -1274,7 +1302,7 @@ def make_kid_rl_velocity_env_cfg(
       # command implies to score most of the term.
       "std": 0.1,
       "min_step_distance": 0.02,
-      "min_swing_height": 0.02,
+      "min_swing_height": 0.03,
     },
   )
 
@@ -1317,7 +1345,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.2,
+    weight=-0.4,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1370,15 +1398,15 @@ def make_kid_rl_velocity_env_cfg(
   # ---------------------------- Events ----------------------------
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
   # Sample initial base roll and pitch in either direction.
-  init_tilt = float(np.deg2rad(10.0))
+  init_tilt = float(np.deg2rad(0.0))
   cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
   cfg.events["reset_base"].params["pose_range"]["pitch"] = (-init_tilt, init_tilt)
   # Randomize only actuated joints; the passive roll-linkage followers are
   # constrained by the mechanism and must not be offset independently.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.3, 0.3),
-      "velocity_range": (-0.3, 0.3),
+      "position_range": (-0.0, 0.0),
+      "velocity_range": (-0.0, 0.0),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
     }
   )
@@ -1583,11 +1611,11 @@ def make_kid_rl_velocity_env_cfg(
         threshold_start=0.23,
         threshold_end=3.0,
         push_full_scale={
-          "x": 0.5,
-          "y": 0.5,
-          "roll": 0.52,
-          "pitch": 0.52,
-          "yaw": 0.52,
+          "x": 0.0,
+          "y": 0.0,
+          "roll": 0.0,
+          "pitch": 0.0,
+          "yaw": 0.0,
         },
       ),
     },
@@ -1708,8 +1736,8 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     },
     symmetry_cfg={
       "use_data_augmentation": False,
-      "use_mirror_loss": False,
-      "mirror_loss_coeff": 0.1,
+      "use_mirror_loss": True,
+      "mirror_loss_coeff": 0.2,
       "data_augmentation_func": compute_symmetric_states,
     },
   ),
