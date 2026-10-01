@@ -10,8 +10,11 @@ from mjlab_kid_rl.tasks.mdp import (
   airborne_foot_arm_swing_reward,
   default_joint_pose_exp,
   feet_air_time_continuous_reward,
+  both_feet_airborne_penalty,
+  gait_symmetry_reward,
   feet_crossing_reward,
   feet_distance_penalty,
+  foot_landing_alignment_reward,
   gait_phase_swing_clearance_reward,
   swing_progress_reward,
   flatness_weighted_foot_slip_penalty,
@@ -33,6 +36,78 @@ class _TestScene(dict):
   @property
   def sensors(self):
     return self
+
+
+class TestFootLandingAlignment(unittest.TestCase):
+  def setUp(self):
+    self.contact = torch.ones((1, 2), dtype=torch.bool)
+    self.landed = torch.tensor([[True, False]])
+    self.air_time = torch.zeros((1, 2))
+    self.quat = torch.tensor([[[1., 0., 0., 0.], [1., 0., 0., 0.]]])
+    self.terrain = types.SimpleNamespace(
+      normals_w=torch.tensor([[[0., 0., 1.]] * 4]),
+      hit_pos_w=torch.zeros((1, 4, 3)),
+      distances=torch.ones((1, 4)),
+    )
+    sensor = types.SimpleNamespace(
+      data=types.SimpleNamespace(found=self.contact, current_air_time=self.air_time),
+      compute_first_contact=lambda dt: self.landed,
+    )
+    self.env = types.SimpleNamespace(
+      num_envs=1, device="cpu", step_dt=0.02,
+      scene=_TestScene(
+        contact=sensor, height=types.SimpleNamespace(data=self.terrain),
+        robot=types.SimpleNamespace(data=types.SimpleNamespace(body_link_quat_w=self.quat)),
+      ),
+    )
+    self.term = foot_landing_alignment_reward(None, self.env)
+    self.asset_cfg = types.SimpleNamespace(name="robot", body_ids=[0, 1])
+
+  def reward(self):
+    return self.term(self.env, "contact", "height", self.asset_cfg)
+
+  def test_only_first_contact_is_paid(self):
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+    self.landed[:] = False
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+
+  def test_sixty_degree_misalignment(self):
+    self.quat[0, 0] = torch.tensor([math.cos(math.pi/6), 0., math.sin(math.pi/6), 0.])
+    torch.testing.assert_close(self.reward(), torch.tensor([0.5]))
+
+  def test_terrain_normal_on_slope(self):
+    self.quat[0, 0] = torch.tensor([math.cos(math.pi/6), 0., math.sin(math.pi/6), 0.])
+    self.terrain.normals_w[0, :2] = torch.tensor([math.sin(math.pi/3), 0., 0.5])
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+
+  def test_highest_valid_ray_and_misses(self):
+    self.terrain.hit_pos_w[0, 0, 2] = -1.
+    self.terrain.normals_w[0, 0] = torch.tensor([1., 0., 0.1])
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+    self.terrain.distances[:] = -1.
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+
+  def test_hop_and_staggered_landing_are_excluded(self):
+    self.contact[:] = False
+    self.air_time[:] = 0.08
+    self.landed[:] = False
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.contact[0, 0] = True
+    self.landed[0, 0] = True
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.contact[:] = True
+    self.landed[:] = torch.tensor([[False, True]])
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.landed[:] = torch.tensor([[True, False]])
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+
+  def test_simultaneous_landing_and_reset(self):
+    self.landed[:] = True
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.term.hop_in_progress[:] = True
+    self.term.reset(torch.tensor([0]))
+    self.landed[:] = torch.tensor([[True, False]])
+    torch.testing.assert_close(self.reward(), torch.ones(1))
 
 
 class TestDefaultJointPoseReward(unittest.TestCase):
@@ -472,6 +547,74 @@ class TestContinuousAirTimeReward(unittest.TestCase):
     torch.testing.assert_close(self._reward(), torch.zeros(1))
 
 
+class TestDoubleFlightPenalty(unittest.TestCase):
+  def test_only_sustained_double_flight_during_walking_is_charged(self) -> None:
+    sensor = types.SimpleNamespace(data=types.SimpleNamespace(
+      found=torch.tensor([[False, False]]),
+      current_air_time=torch.tensor([[0.04, 0.04]]),
+    ))
+    command = torch.tensor([[0.2, 0.0, 0.0]])
+    env = types.SimpleNamespace(
+      scene={"feet": sensor},
+      command_manager=types.SimpleNamespace(get_command=lambda _: command),
+    )
+    def reward() -> torch.Tensor:
+      return both_feet_airborne_penalty(
+        env, sensor_name="feet", min_air_time_s=0.06,
+      )
+    torch.testing.assert_close(reward(), torch.zeros(1))
+    sensor.data.current_air_time[:] = 0.08
+    torch.testing.assert_close(reward(), torch.ones(1))
+    sensor.data.found[0, 0] = True
+    torch.testing.assert_close(reward(), torch.zeros(1))
+    sensor.data.found[0, 0] = False
+    command[:] = 0.0
+    torch.testing.assert_close(reward(), torch.zeros(1))
+
+
+class TestGaitSymmetryHopGate(unittest.TestCase):
+  def test_alternating_walk_pays_but_staggered_hop_does_not(self) -> None:
+    lifted = torch.zeros((1, 2), dtype=torch.bool)
+    landed = torch.tensor([[True, False]])
+    sensor = types.SimpleNamespace(
+      data=types.SimpleNamespace(
+        found=torch.tensor([[True, True]]),
+        current_air_time=torch.zeros((1, 2)),
+        last_air_time=torch.full((1, 2), 0.3),
+      ),
+      compute_first_air=lambda dt: lifted,
+      compute_first_contact=lambda dt: landed,
+    )
+    asset = types.SimpleNamespace(
+      data=types.SimpleNamespace(site_pos_w=torch.tensor([[[0.1, 0.0, 0.0], [0.1, 0.0, 0.0]]])),
+      find_sites=lambda names: ([0, 1], names),
+    )
+    env = types.SimpleNamespace(
+      num_envs=1, device=torch.device("cpu"), step_dt=0.02,
+      scene={"feet": sensor, "robot": asset},
+      command_manager=types.SimpleNamespace(get_command=lambda _: torch.tensor([[0.2, 0.0, 0.0]])),
+    )
+    asset_cfg = types.SimpleNamespace(name="robot", site_names=("left", "right"), site_ids=[0, 1])
+    term = gait_symmetry_reward(types.SimpleNamespace(params={"asset_cfg": asset_cfg}), env)
+    def reward() -> torch.Tensor:
+      return term(env, sensor_name="feet", asset_cfg=asset_cfg)
+
+    torch.testing.assert_close(reward(), torch.zeros(1))
+    landed[:] = torch.tensor([[False, True]])
+    torch.testing.assert_close(reward(), torch.ones(1))
+
+    landed[:] = False
+    sensor.data.found[:] = False
+    sensor.data.current_air_time[:] = 0.08
+    torch.testing.assert_close(reward(), torch.zeros(1))
+    landed[:] = torch.tensor([[True, False]])
+    sensor.data.found[:] = torch.tensor([[True, False]])
+    torch.testing.assert_close(reward(), torch.zeros(1))
+    landed[:] = torch.tensor([[False, True]])
+    sensor.data.found[:] = True
+    torch.testing.assert_close(reward(), torch.zeros(1))
+
+
 class TestDelayedNotSteppingPenalty(unittest.TestCase):
   def setUp(self) -> None:
     self.command = torch.tensor([[0.2, 0.0, 0.0]])
@@ -778,41 +921,80 @@ class TestFootBaseHeadingPenalty(unittest.TestCase):
 
 
 class TestSwingProgressReward(unittest.TestCase):
-  def test_current_height_pays_each_step_without_negative_descent(self) -> None:
-    contact = types.SimpleNamespace(
+  def setUp(self) -> None:
+    self.contact = types.SimpleNamespace(
       data=types.SimpleNamespace(found=torch.tensor([[True, False]]))
     )
-    height = types.SimpleNamespace(
-      data=types.SimpleNamespace(heights=torch.tensor([[0.0, 0.0125]]))
+    self.height = types.SimpleNamespace(
+      data=types.SimpleNamespace(heights=torch.tensor([[0.0, 0.02]]))
     )
-    command = torch.tensor([[0.2, 0.0, 0.0]])
-    env = types.SimpleNamespace(
-      scene={"feet": contact, "height": height},
-      command_manager=types.SimpleNamespace(get_command=lambda _: command),
+    self.command = torch.tensor([[0.2, 0.0, 0.0]])
+    self.env = types.SimpleNamespace(
+      scene={"feet": self.contact, "height": self.height},
+      command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
+    )
+    self.term = swing_progress_reward(
+      types.SimpleNamespace(params={"sensor_name": "feet"}), self.env
     )
 
-    def reward() -> torch.Tensor:
-      return swing_progress_reward(
-        env, sensor_name="feet", height_sensor_name="height",
-        min_height=0.005, target_height=0.02,
-      )
+  def reward(self) -> torch.Tensor:
+    return self.term(
+      self.env, sensor_name="feet", height_sensor_name="height",
+      min_height=0.005, target_height=0.02, height_std=0.01,
+      pair_bonus_scale=5.0,
+    )
 
-    torch.testing.assert_close(reward(), torch.tensor([0.5]))
-    torch.testing.assert_close(reward(), torch.tensor([0.5]))  # same height, same reward
-    height.data.heights[0, 1] = 0.02
-    torch.testing.assert_close(reward(), torch.ones(1))
-    height.data.heights[0, 1] = 0.01
-    torch.testing.assert_close(reward(), torch.tensor([1.0 / 3.0]))
+  def land_both(self) -> torch.Tensor:
+    self.contact.data.found[:] = torch.tensor([[True, True]])
+    self.height.data.heights[:] = 0.0
+    return self.reward()
 
-    contact.data.found[:] = torch.tensor([[False, False]])
-    torch.testing.assert_close(reward(), torch.zeros(1))
-    contact.data.found[:] = torch.tensor([[True, True]])
-    torch.testing.assert_close(reward(), torch.zeros(1))
-    contact.data.found[:] = torch.tensor([[False, True]])
-    height.data.heights[:] = torch.tensor([[0.02, 0.0]])
-    torch.testing.assert_close(reward(), torch.ones(1))
-    command[:] = 0.0
-    torch.testing.assert_close(reward(), torch.zeros(1))
+  def test_holding_one_foot_or_repeating_it_does_not_keep_paying(self) -> None:
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.height.data.heights[0, 1] = 0.01
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    torch.testing.assert_close(self.land_both(), torch.zeros(1))
+    self.contact.data.found[:] = torch.tensor([[True, False]])
+    self.height.data.heights[0, 1] = 0.02
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    torch.testing.assert_close(self.land_both(), torch.zeros(1))
+
+  def test_equal_alternating_peaks_pay_more_than_unequal(self) -> None:
+    self.reward()
+    self.land_both()
+    self.contact.data.found[:] = torch.tensor([[False, True]])
+    self.height.data.heights[0, 0] = 0.02
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+    torch.testing.assert_close(self.land_both(), torch.tensor([5.0]))
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+
+    self.term.reset()
+    self.contact.data.found[:] = torch.tensor([[True, False]])
+    self.height.data.heights[0, 1] = 0.01
+    torch.testing.assert_close(self.reward(), torch.tensor([1.0 / 3.0]))
+    self.land_both()
+    self.contact.data.found[:] = torch.tensor([[False, True]])
+    self.height.data.heights[0, 0] = 0.02
+    torch.testing.assert_close(self.reward(), torch.ones(1))
+    torch.testing.assert_close(
+      self.land_both(), torch.tensor([5.0 / 3.0 * math.exp(-0.5)])
+    )
+
+  def test_two_foot_hop_and_standing_receive_zero(self) -> None:
+    self.contact.data.found[:] = torch.tensor([[False, False]])
+    self.height.data.heights[:] = 0.02
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.contact.data.found[:] = torch.tensor([[True, False]])
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.land_both()
+    self.contact.data.found[:] = torch.tensor([[False, True]])
+    self.height.data.heights[0, 0] = 0.02
+    self.command[:] = 0.0
+    torch.testing.assert_close(self.reward(), torch.zeros(1))
+    self.term.reset()
+    self.command[0, 0] = 0.2
+    torch.testing.assert_close(self.reward(), torch.ones(1))
 
 
 class TestGaitPhaseSwingClearanceReward(unittest.TestCase):
@@ -839,13 +1021,13 @@ class TestGaitPhaseSwingClearanceReward(unittest.TestCase):
   def test_selected_foot_receives_partial_progress_before_liftoff(self) -> None:
     # At phase 0.25, the right foot is due to swing. Partial height pays even
     # before its last contact disappears; the left foot receives no credit.
-    self.height.data.heights[:] = torch.tensor([[0.02, 0.0125]])
+    self.height.data.heights[:] = torch.tensor([[0.03, 0.0175]])
     torch.testing.assert_close(self._reward(), torch.tensor([0.5]))
-    self.height.data.heights[0, 1] = 0.02
+    self.height.data.heights[0, 1] = 0.03
     torch.testing.assert_close(self._reward(), torch.ones(1))
 
   def test_requires_opposite_foot_contact_and_turns_off_in_double_support(self) -> None:
-    self.height.data.heights[0, 1] = 0.02
+    self.height.data.heights[0, 1] = 0.03
     self.contact.data.found[0, 0] = False
     torch.testing.assert_close(self._reward(), torch.zeros(1))
     self.contact.data.found[0, 0] = True
@@ -854,7 +1036,7 @@ class TestGaitPhaseSwingClearanceReward(unittest.TestCase):
 
   def test_other_half_cycle_and_standing_command(self) -> None:
     self.phase[:] = 0.75
-    self.height.data.heights[0, 0] = 0.02
+    self.height.data.heights[0, 0] = 0.03
     torch.testing.assert_close(self._reward(), torch.ones(1))
     self.command[:] = 0.0
     torch.testing.assert_close(self._reward(), torch.zeros(1))
@@ -863,7 +1045,10 @@ class TestGaitPhaseSwingClearanceReward(unittest.TestCase):
 class TestOneShotSwingHeightReward(unittest.TestCase):
   def setUp(self) -> None:
     self.contact = types.SimpleNamespace(
-      data=types.SimpleNamespace(found=torch.tensor([[1, 0]]))
+      data=types.SimpleNamespace(
+        found=torch.tensor([[1, 0]]),
+        current_air_time=torch.zeros((1, 2)),
+      )
     )
     self.height = types.SimpleNamespace(
       num_frames=2,
@@ -911,6 +1096,19 @@ class TestOneShotSwingHeightReward(unittest.TestCase):
     self.contact.data.found[:] = torch.tensor([[1, 1]])
     torch.testing.assert_close(self._reward(), torch.zeros(1))
 
+    self.contact.data.found[:] = torch.tensor([[1, 0]])
+    torch.testing.assert_close(self._reward(), torch.ones(1))
+
+  def test_staggered_landing_after_hop_does_not_get_crossing_bonus(self) -> None:
+    self.contact.data.found[:] = torch.tensor([[0, 0]])
+    self.contact.data.current_air_time[:] = 0.08
+    self.height.data.heights[:] = 0.02
+    torch.testing.assert_close(self._reward(), torch.zeros(1))
+    self.contact.data.found[:] = torch.tensor([[1, 0]])
+    torch.testing.assert_close(self._reward(), torch.zeros(1))
+    self.contact.data.found[:] = torch.tensor([[1, 1]])
+    torch.testing.assert_close(self._reward(), torch.zeros(1))
+    self.contact.data.current_air_time[:] = 0.0
     self.contact.data.found[:] = torch.tensor([[1, 0]])
     torch.testing.assert_close(self._reward(), torch.ones(1))
 

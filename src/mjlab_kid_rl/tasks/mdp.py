@@ -536,7 +536,7 @@ def foot_base_heading_error_penalty(
 
 
 class _LandingTrackingReward:
-    """Pay half of movement tracking at 2 cm clearance and half at landing."""
+    """Pay half of movement tracking at 3 cm clearance and half at landing."""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
         sensor: ContactSensor = env.scene[cfg.params["sensor_name"]]
@@ -608,7 +608,7 @@ class _LandingTrackingReward:
 
 
 class track_linear_velocity_gated(_LandingTrackingReward):
-    """Pay linear tracking at 2 cm clearance and landing, or while standing."""
+    """Pay linear tracking at 3 cm clearance and landing, or while standing."""
 
     def __call__(
         self,
@@ -619,7 +619,7 @@ class track_linear_velocity_gated(_LandingTrackingReward):
         height_sensor_name: str,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
         command_threshold: float = 0.05,
-        min_air_height: float = 0.02,
+        min_air_height: float = 0.03,
         max_air_time: float = 0.6,
     ) -> torch.Tensor:
         asset: Entity = env.scene[asset_cfg.name]
@@ -637,7 +637,7 @@ class track_linear_velocity_gated(_LandingTrackingReward):
 
 
 class track_angular_velocity_gated(_LandingTrackingReward):
-    """Pay angular tracking at 2 cm clearance and landing, or while standing."""
+    """Pay angular tracking at 3 cm clearance and landing, or while standing."""
 
     def __call__(
         self,
@@ -648,7 +648,7 @@ class track_angular_velocity_gated(_LandingTrackingReward):
         height_sensor_name: str,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
         command_threshold: float = 0.05,
-        min_air_height: float = 0.02,
+        min_air_height: float = 0.03,
         max_air_time: float = 0.6,
     ) -> torch.Tensor:
         asset: Entity = env.scene[asset_cfg.name]
@@ -748,8 +748,8 @@ class gait_symmetry_reward:
     other alternates just fine. This term covers the missing half: the two
     legs' steps should also match each other.
 
-    Two mismatches are measured, both only at the instant a foot lands
-    (sensor.compute_first_contact):
+    Two mismatches are measured when a foot lands after the opposite foot.
+    A sustained two-foot flight invalidates that pair and receives no reward.
 
     - swing duration: |last_air_time_left - last_air_time_right|, in seconds.
       The contact sensor latches each foot's completed swing into
@@ -803,12 +803,22 @@ class gait_symmetry_reward:
             (env.num_envs, num_feet, 2), device=env.device
         )
         self.last_step_len = torch.zeros((env.num_envs, num_feet), device=env.device)
+        self.last_step_air_time = torch.zeros_like(self.last_step_len)
+        self.valid_step = torch.zeros_like(self.last_step_len, dtype=torch.bool)
+        self.last_landed_side = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+        self.hop_in_progress = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
     def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
         if env_ids is None:
             env_ids = slice(None)
         self.liftoff_pos_xy[env_ids] = 0.0
         self.last_step_len[env_ids] = 0.0
+        self.last_step_air_time[env_ids] = 0.0
+        self.valid_step[env_ids] = False
+        self.last_landed_side[env_ids] = -1
+        self.hop_in_progress[env_ids] = False
 
     def __call__(
         self,
@@ -819,10 +829,25 @@ class gait_symmetry_reward:
         command_threshold: float = 0.05,
         duration_std: float = 0.1,
         length_std: float = 0.05,
+        min_double_air_time_s: float = 0.06,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_lifted = sensor.compute_first_air(dt=env.step_dt)  # [B, F]
         just_landed = sensor.compute_first_contact(dt=env.step_dt)  # [B, F]
+        found = sensor.data.found
+        current_air_time = sensor.data.current_air_time
+        assert found is not None and current_air_time is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        contact = found.bool()
+        double_flight = (~contact).all(dim=-1) & (
+            current_air_time >= min_double_air_time_s
+        ).all(dim=-1)
+        self.hop_in_progress |= double_flight
+        # A hop invalidates both stored steps until each foot makes a new
+        # single-support swing and lands again.
+        self.valid_step[self.hop_in_progress] = False
+        valid_landing = just_landed & ~self.hop_in_progress.unsqueeze(-1)
 
         asset: Entity = env.scene[asset_cfg.name]
         foot_pos_xy = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]  # [B, F, 2]
@@ -830,7 +855,7 @@ class gait_symmetry_reward:
             just_lifted.unsqueeze(-1), foot_pos_xy, self.liftoff_pos_xy
         )
         step_len = torch.norm(foot_pos_xy - self.liftoff_pos_xy, dim=-1)  # [B, F]
-        self.last_step_len = torch.where(just_landed, step_len, self.last_step_len)
+        self.last_step_len = torch.where(valid_landing, step_len, self.last_step_len)
 
         last_air = sensor.data.last_air_time
         assert last_air is not None, (
@@ -838,7 +863,13 @@ class gait_symmetry_reward:
             "gait_symmetry_penalty."
         )
 
-        duration_gap = torch.abs(last_air[:, 0] - last_air[:, 1])  # [B]
+        self.last_step_air_time = torch.where(
+            valid_landing, last_air, self.last_step_air_time
+        )
+        self.valid_step |= valid_landing & (last_air > 0.0) & (step_len > 0.0)
+        duration_gap = torch.abs(
+            self.last_step_air_time[:, 0] - self.last_step_air_time[:, 1]
+        )  # [B]
         length_gap = torch.abs(
             self.last_step_len[:, 0] - self.last_step_len[:, 1]
         )  # [B]
@@ -846,10 +877,12 @@ class gait_symmetry_reward:
         # Only comparable once *both* legs have a completed step on record.
         # Before that one side is still the zero it was reset to, which would
         # read as a large mismatch on the very first landing of an episode.
-        both_stepped = (last_air > 0.0).all(dim=-1) & (
-            self.last_step_len > 0.0
-        ).all(dim=-1)
-        landed = just_landed.any(dim=-1)
+        both_stepped = self.valid_step.all(dim=-1)
+        single_landing = valid_landing.sum(dim=-1) == 1
+        landed_side = valid_landing.long().argmax(dim=-1)
+        alternating = single_landing & (just_landed.sum(dim=-1) == 1) & (
+            self.last_landed_side >= 0
+        ) & (landed_side != self.last_landed_side)
 
         # Gaussian on each gap rather than the raw sum, for two reasons. The raw
         # sum is unbounded, so one leg that never swings (a multi-second gap)
@@ -863,7 +896,16 @@ class gait_symmetry_reward:
         duration_score = torch.exp(-((duration_gap / duration_std) ** 2))
         length_score = torch.exp(-((length_gap / length_std) ** 2))
         reward = 0.5 * (duration_score + length_score)
-        reward = reward * (landed & both_stepped).float()
+        reward = reward * (alternating & both_stepped).float()
+        self.last_landed_side = torch.where(
+            single_landing, landed_side,
+            torch.where(
+                just_landed.any(dim=-1),
+                torch.full_like(self.last_landed_side, -1),
+                self.last_landed_side,
+            ),
+        )
+        self.hop_in_progress &= ~contact.all(dim=-1)
 
         command = env.command_manager.get_command(command_name)
         if command is not None:
@@ -981,7 +1023,7 @@ class forward_step_reward:
         std: float = 0.05,
         command_threshold: float = 0.05,
         min_step_distance: float = 0.02,
-        min_swing_height: float = 0.02,
+        min_swing_height: float = 0.03,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_lifted = sensor.compute_first_air(dt=env.step_dt)  # [B, 2]
@@ -1413,12 +1455,12 @@ def gait_phase_swing_clearance_reward(
     command_threshold: float = 0.01,
     double_support_band: float = 0.1,
     min_height: float = 0.005,
-    target_height: float = 0.02,
+    target_height: float = 0.03,
 ) -> torch.Tensor:
     """Gradually reward lifting the clock-selected swing foot.
 
     Unlike the one-off feet_crossing milestone, this pays partial progress below
-    2 cm. The opposite foot must remain planted, and the double-support phase
+    3 cm. The opposite foot must remain planted, and the double-support phase
     pays nothing. The small deadband avoids paying for sole clearance at rest.
     """
     if target_height <= min_height:
@@ -1515,6 +1557,29 @@ def feet_air_time_continuous_reward(
     return (in_air & valid_duration).any(dim=-1).float() * (
         single_swing & active
     ).float()
+
+
+def both_feet_airborne_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    min_air_time_s: float = 0.06,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+) -> torch.Tensor:
+    """Charge sustained double flight during a walking command."""
+    sensor: ContactSensor = env.scene[sensor_name]
+    found = sensor.data.found
+    current_air_time = sensor.data.current_air_time
+    assert found is not None and current_air_time is not None
+    if found.dim() == 3:
+        found = found.any(dim=-1)
+    double_flight = (~found.bool()).all(dim=-1) & (
+        current_air_time >= min_air_time_s
+    ).all(dim=-1)
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
+    return (double_flight & (speed > command_threshold)).float()
 
 
 def overlong_swing_penalty(
@@ -1652,45 +1717,116 @@ class not_stepping_each_foot_penalty:
         return overdue.sum(dim=-1).float()
 
 
-def swing_progress_reward(
-    env: ManagerBasedRlEnv,
-    sensor_name: str,
-    height_sensor_name: str,
-    min_height: float = 0.005,
-    target_height: float = 0.02,
-    command_name: str = "twist",
-    command_threshold: float = 0.01,
-) -> torch.Tensor:
-    """Reward current swing-foot clearance without a gait phase or band.
+class swing_progress_reward:
+    """Reward new lift height and a matched, alternating pair of landed swings.
 
-    The opposite foot must stay planted, and the selected swing foot must be
-    airborne. Clearance pays linearly from min_height to target_height on each
-    step; lowering the foot reduces the reward but never makes it negative.
+    Holding a foot at a fixed height pays nothing after the initial rise.
+    Landing rewards only an alternating left/right pair; both feet must have
+    cleared min_height, and the lower peak limits the pair's score.
     """
-    if target_height <= min_height:
-        raise ValueError("target_height must be greater than min_height")
 
-    sensor: ContactSensor = env.scene[sensor_name]
-    found = sensor.data.found
-    assert found is not None
-    if found.dim() == 3:
-        found = found.any(dim=-1)
-    contact = found.bool()  # [B, 2] (left, right)
-    heights = env.scene[height_sensor_name].data.heights
-    progress = ((heights - min_height) / (target_height - min_height)).clamp(0.0, 1.0)
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        sensor: ContactSensor = env.scene[cfg.params["sensor_name"]]
+        found = sensor.data.found
+        assert found is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        if found.shape[-1] != 2:
+            raise ValueError("swing_progress_reward requires left and right foot contacts")
+        self.current_peak = torch.zeros_like(found, dtype=torch.float)
+        self.last_peak = torch.zeros_like(self.current_peak)
+        self.has_completed = torch.zeros_like(found, dtype=torch.bool)
+        self.was_air = torch.zeros_like(found, dtype=torch.bool)
+        self.valid_swing = torch.zeros_like(found, dtype=torch.bool)
+        self.last_landed_side = torch.full(
+            (found.shape[0],), -1, dtype=torch.long, device=found.device
+        )
 
-    right_swing = contact[:, 0] & ~contact[:, 1]
-    left_swing = contact[:, 1] & ~contact[:, 0]
-    reward = (
-        progress[:, 1] * right_swing.float()
-        + progress[:, 0] * left_swing.float()
-    )
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self.current_peak[env_ids] = 0.0
+        self.last_peak[env_ids] = 0.0
+        self.has_completed[env_ids] = False
+        self.was_air[env_ids] = False
+        self.valid_swing[env_ids] = False
+        self.last_landed_side[env_ids] = -1
 
-    command = env.command_manager.get_command(command_name)
-    assert command is not None
-    speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
-    return reward * (speed > command_threshold).float()
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        height_sensor_name: str,
+        min_height: float = 0.005,
+        target_height: float = 0.03,
+        command_name: str = "twist",
+        command_threshold: float = 0.01,
+        height_std: float = 0.01,
+        pair_bonus_scale: float = 5.0,
+    ) -> torch.Tensor:
+        if target_height <= min_height:
+            raise ValueError("target_height must be greater than min_height")
+        if height_std <= 0.0:
+            raise ValueError("height_std must be positive")
+        if pair_bonus_scale < 0.0:
+            raise ValueError("pair_bonus_scale must be nonnegative")
 
+        sensor: ContactSensor = env.scene[sensor_name]
+        found = sensor.data.found
+        assert found is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        contact = found.bool()  # [B, 2] (left, right)
+        in_air = ~contact
+        heights = env.scene[height_sensor_name].data.heights
+
+        previous_peak = self.current_peak
+        current_peak = torch.where(
+            in_air, torch.maximum(previous_peak, heights.clamp_min(0.0)),
+            torch.zeros_like(previous_peak),
+        )
+        previous_progress = ((previous_peak - min_height) / (target_height - min_height)).clamp(0.0, 1.0)
+        current_progress = ((current_peak - min_height) / (target_height - min_height)).clamp(0.0, 1.0)
+        rise = current_progress - previous_progress
+        # A repeat by the last landing foot cannot collect another lift reward.
+        eligible_foot = torch.arange(2, device=contact.device).unsqueeze(0) != self.last_landed_side.unsqueeze(-1)
+        single_swing = in_air.sum(dim=-1) == 1
+        lift_reward = (rise * in_air.float() * eligible_foot.float()).sum(dim=-1)
+        lift_reward *= single_swing.float()
+
+        started = in_air & ~self.was_air
+        self.valid_swing = torch.where(started, torch.ones_like(self.valid_swing), self.valid_swing)
+        self.valid_swing &= ~(in_air.all(dim=-1).unsqueeze(-1))
+        landed = self.was_air & contact
+        valid_landing = landed & self.valid_swing
+        self.last_peak = torch.where(valid_landing, previous_peak, self.last_peak)
+        self.has_completed |= valid_landing & (previous_peak > min_height)
+        single_landing = landed.sum(dim=-1) == 1
+        landed_side = landed.long().argmax(dim=-1)
+        alternating = single_landing & valid_landing.any(dim=-1) & (
+            self.last_landed_side >= 0
+        ) & (landed_side != self.last_landed_side)
+        both_completed = self.has_completed.all(dim=-1)
+        peak_progress = ((self.last_peak - min_height) / (target_height - min_height)).clamp(0.0, 1.0)
+        lower_peak_progress = peak_progress.min(dim=-1).values
+        height_gap = self.last_peak[:, 0] - self.last_peak[:, 1]
+        height_match = torch.exp(-0.5 * (height_gap / height_std).square())
+        pair_reward = pair_bonus_scale * lower_peak_progress * height_match
+        pair_reward *= (alternating & both_completed).float()
+        self.last_landed_side = torch.where(single_landing, landed_side, self.last_landed_side)
+        self.last_landed_side = torch.where(
+            landed.sum(dim=-1) > 1,
+            torch.full_like(self.last_landed_side, -1),
+            self.last_landed_side,
+        )
+        self.current_peak = current_peak
+        self.was_air = in_air
+        self.valid_swing &= in_air
+
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
+        return (lift_reward + pair_reward) * (speed > command_threshold).float()
 
 def base_height_penalty(
     env: ManagerBasedRlEnv,
@@ -1802,6 +1938,79 @@ class upper_body_excursion_penalty:
         joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
         excess = torch.clamp(torch.abs(joint_pos) - self.max_excursion, min=0.0)
         return torch.sum(excess, dim=-1)
+
+
+class foot_landing_alignment_reward:
+    """Reward sole/terrain normal alignment once on a normal single-foot landing.
+
+    Foot bodies and height-sensor frames must share left/right order. Use the
+    highest valid terrain hit under each sole, matching minimum-height reduction.
+    Sustained two-foot flight invalidates the subsequent landing sequence.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        self.hop_in_progress = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        self.hop_in_progress[slice(None) if env_ids is None else env_ids] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        height_sensor_name: str,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        min_double_air_time_s: float = 0.06,
+    ) -> torch.Tensor:
+        sensor: ContactSensor = env.scene[sensor_name]
+        found = sensor.data.found
+        assert found is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        contact = found.bool()  # [B, F]
+        air_time = sensor.data.current_air_time
+        assert air_time is not None
+        sustained_hop = ((~contact) & (air_time >= min_double_air_time_s)).all(dim=-1)
+        self.hop_in_progress |= sustained_hop
+        landed = sensor.compute_first_contact(dt=env.step_dt)
+        both_planted = contact.all(dim=-1)
+        valid_landing = (
+            (landed.sum(dim=-1) == 1) & both_planted & ~self.hop_in_progress
+        )
+
+        asset: Entity = env.scene[asset_cfg.name]
+        quat = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]
+        local_up = torch.zeros_like(quat[..., :3])
+        local_up[..., 2] = 1.0
+        sole_normal = quat_apply(quat, local_up)  # [B, F, 3]
+
+        terrain = env.scene[height_sensor_name].data
+        batch, feet = contact.shape
+        normals = terrain.normals_w.reshape(batch, feet, -1, 3)
+        hits = terrain.hit_pos_w.reshape(batch, feet, -1, 3)
+        distances = terrain.distances.reshape(batch, feet, -1)
+        valid_ray = (
+            (distances >= 0.0) & (normals[..., 2] > 0.0)
+            & torch.isfinite(normals).all(dim=-1)
+            & torch.isfinite(hits).all(dim=-1)
+        )
+        hit_z = hits[..., 2].masked_fill(~valid_ray, -torch.inf)
+        ray_index = hit_z.argmax(dim=-1)
+        ground_normal = normals.gather(
+            2, ray_index[..., None, None].expand(-1, -1, 1, 3)
+        ).squeeze(2)
+        ground_normal = torch.nan_to_num(ground_normal)
+        ground_normal = ground_normal / torch.linalg.vector_norm(
+            ground_normal, dim=-1, keepdim=True
+        ).clamp_min(1e-8)
+        alignment = (sole_normal * ground_normal).sum(dim=-1).clamp(0.0, 1.0)
+        reward = (
+            alignment * landed.float() * valid_ray.any(dim=-1).float()
+        ).sum(dim=-1) * valid_landing.float()
+        self.hop_in_progress &= ~both_planted
+        return reward
 
 
 def foot_flatness_penalty(
@@ -1921,7 +2130,8 @@ class feet_crossing_reward:
     is planted and the other is airborne. The airborne foot earns the base
     reward once when it first reaches ``min_swing_height``. The next opposite
     foot to reach the threshold earns a one-off bonus. Contact rearms that
-    foot for its next swing.
+    foot for its next swing. A swing containing sustained double flight is
+    ineligible even if one foot lands first.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
@@ -1934,22 +2144,25 @@ class feet_crossing_reward:
         self.first_crossing_foot = torch.full(
             (env.num_envs,), -1, device=env.device, dtype=torch.long
         )
+        self.invalid_this_swing = torch.zeros_like(self.rewarded_this_swing)
 
     def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
         if env_ids is None:
             env_ids = slice(None)
         self.rewarded_this_swing[env_ids] = False
         self.first_crossing_foot[env_ids] = -1
+        self.invalid_this_swing[env_ids] = False
 
     def __call__(
         self,
         env: ManagerBasedRlEnv,
         sensor_name: str,
         height_sensor_name: str,
-        min_swing_height: float = 0.02,
+        min_swing_height: float = 0.03,
         alternation_bonus: float = 1.0,
         command_name: str = "twist",
         command_threshold: float = 0.05,
+        min_double_air_time_s: float = 0.06,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         found = sensor.data.found  # [B, F] or [B, F, num_slots]
@@ -1958,6 +2171,19 @@ class feet_crossing_reward:
             found = found.any(dim=-1)
         in_contact = found.bool()  # [B, F]
         single_support = in_contact.sum(dim=-1) == 1  # [B]
+        current_air_time = sensor.data.current_air_time
+        assert current_air_time is not None
+        double_flight = (~in_contact).all(dim=-1) & (
+            current_air_time >= min_double_air_time_s
+        ).all(dim=-1)
+        self.invalid_this_swing = torch.where(
+            in_contact, torch.zeros_like(self.invalid_this_swing),
+            self.invalid_this_swing | double_flight.unsqueeze(-1),
+        )
+        self.first_crossing_foot = torch.where(
+            double_flight, torch.full_like(self.first_crossing_foot, -1),
+            self.first_crossing_foot,
+        )
 
         height_sensor = env.scene[height_sensor_name]
         heights = height_sensor.data.heights  # [B, F]
@@ -1971,6 +2197,7 @@ class feet_crossing_reward:
             ~in_contact
             & (heights >= min_swing_height)
             & single_support.unsqueeze(-1)
+            & ~self.invalid_this_swing
             & active.unsqueeze(-1)
         )
         newly_reached = eligible & ~self.rewarded_this_swing
