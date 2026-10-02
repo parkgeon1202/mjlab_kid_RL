@@ -777,7 +777,7 @@ def make_kid_rl_velocity_env_cfg(
   # Reuse one velocity-command cutoff for upright target selection, pose,
   # foot clearance, air time, and foot slip.
   walking_threshold = 0.01
-  max_swing_time = 0.6
+  max_swing_time = 0.7
 
   # Track commanded velocity continuously with mjlab's built-in rewards.
   cfg.rewards["track_linear_velocity"].func = mdp.track_linear_velocity
@@ -931,7 +931,7 @@ def make_kid_rl_velocity_env_cfg(
   }
   # Pay every step while exactly one foot has been airborne for 0.3--0.7 s.
   # Landing and overlong swings receive no air-time reward.
-  cfg.rewards["air_time"].weight = 1.0
+  cfg.rewards["air_time"].weight = 3.0
   cfg.rewards["both_feet_airborne"] = RewardTermCfg(
     func=both_feet_airborne_penalty,
     weight=-3.0,
@@ -1177,7 +1177,7 @@ def make_kid_rl_velocity_env_cfg(
   # of landed swings. Holding one foot up does not pay each step.
   cfg.rewards["swing_progress"] = RewardTermCfg(
     func=swing_progress_reward,
-    weight=0.5,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1214,7 +1214,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=0.5,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1249,7 +1249,7 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-2.0,
+    weight=-3.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
@@ -1272,7 +1272,7 @@ def make_kid_rl_velocity_env_cfg(
   # Keep the one-off bonus when the next qualifying foot is the opposite one.
   cfg.rewards["feet_crossing"] = RewardTermCfg(
     func=feet_crossing_reward,
-    weight=1.0,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1405,7 +1405,7 @@ def make_kid_rl_velocity_env_cfg(
   # constrained by the mechanism and must not be offset independently.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.3, 0.3),
+      "position_range": (-0.15, 0.15),
       "velocity_range": (-0.3, 0.3),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
     }
