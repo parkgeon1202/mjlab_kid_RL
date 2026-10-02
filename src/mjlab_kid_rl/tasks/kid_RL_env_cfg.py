@@ -777,7 +777,7 @@ def make_kid_rl_velocity_env_cfg(
   # Reuse one velocity-command cutoff for upright target selection, pose,
   # foot clearance, air time, and foot slip.
   walking_threshold = 0.01
-  max_swing_time = 0.7
+  max_swing_time = 0.6
 
   # Track commanded velocity continuously with mjlab's built-in rewards.
   cfg.rewards["track_linear_velocity"].func = mdp.track_linear_velocity
@@ -931,7 +931,7 @@ def make_kid_rl_velocity_env_cfg(
   }
   # Pay every step while exactly one foot has been airborne for 0.3--0.7 s.
   # Landing and overlong swings receive no air-time reward.
-  cfg.rewards["air_time"].weight = 5.0
+  cfg.rewards["air_time"].weight = 1.0
   cfg.rewards["both_feet_airborne"] = RewardTermCfg(
     func=both_feet_airborne_penalty,
     weight=-3.0,
@@ -1177,7 +1177,7 @@ def make_kid_rl_velocity_env_cfg(
   # of landed swings. Holding one foot up does not pay each step.
   cfg.rewards["swing_progress"] = RewardTermCfg(
     func=swing_progress_reward,
-    weight=5.0,
+    weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1214,7 +1214,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=4.0,
+    weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1249,7 +1249,7 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
-    weight=-3.0,
+    weight=-2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_foot_1", "right_foot_1")),
@@ -1259,7 +1259,7 @@ def make_kid_rl_velocity_env_cfg(
   # Reward sole alignment with the actual terrain normal only on landing.
   cfg.rewards["foot_landing_alignment"] = RewardTermCfg(
     func=foot_landing_alignment_reward,
-    weight=3.0,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1272,7 +1272,7 @@ def make_kid_rl_velocity_env_cfg(
   # Keep the one-off bonus when the next qualifying foot is the opposite one.
   cfg.rewards["feet_crossing"] = RewardTermCfg(
     func=feet_crossing_reward,
-    weight=5.0,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1398,15 +1398,15 @@ def make_kid_rl_velocity_env_cfg(
   # ---------------------------- Events ----------------------------
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
   # Sample initial base roll and pitch in either direction.
-  init_tilt = float(np.deg2rad(0.0))
+  init_tilt = float(np.deg2rad(10.0))
   cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
   cfg.events["reset_base"].params["pose_range"]["pitch"] = (-init_tilt, init_tilt)
   # Randomize only actuated joints; the passive roll-linkage followers are
   # constrained by the mechanism and must not be offset independently.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.0, 0.0),
-      "velocity_range": (-0.0, 0.0),
+      "position_range": (-0.3, 0.3),
+      "velocity_range": (-0.3, 0.3),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
     }
   )
@@ -1611,11 +1611,11 @@ def make_kid_rl_velocity_env_cfg(
         threshold_start=0.23,
         threshold_end=3.0,
         push_full_scale={
-          "x": 0.0,
-          "y": 0.0,
-          "roll": 0.0,
-          "pitch": 0.0,
-          "yaw": 0.0,
+          "x": 0.52,
+          "y": 0.52,
+          "roll": 0.52,
+          "pitch": 0.52,
+          "yaw": 0.52,
         },
       ),
     },
@@ -1736,7 +1736,7 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     },
     symmetry_cfg={
       "use_data_augmentation": False,
-      "use_mirror_loss": True,
+      "use_mirror_loss": False,
       "mirror_loss_coeff": 0.2,
       "data_augmentation_func": compute_symmetric_states,
     },
