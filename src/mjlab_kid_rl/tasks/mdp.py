@@ -134,7 +134,9 @@ class UniformVelocityCommandWithRotation(UniformVelocityCommand):
                 torch.tensor(max(y_hi, 0.0), device=self.device),
                 torch.tensor(max(-y_lo, 0.0), device=self.device),
             )
-            speed = self._sample_speed(limit)
+            speed = self._sample_speed(
+                limit, getattr(self.cfg, "lateral_min_lin_vel", None)
+            )
             self.vel_command_b[lat_ids] = 0.0
             self.vel_command_b[lat_ids, 1] = torch.where(left, speed, -speed)
 
@@ -183,12 +185,16 @@ class UniformVelocityCommandWithRotation(UniformVelocityCommand):
         changed = env_ids[rot | fwd | bwd | lat | planar]
         self.vel_command_w[changed] = self.vel_command_b[changed]
 
-    def _sample_speed(self, limit: torch.Tensor) -> torch.Tensor:
-        """Uniform speed in [min(floor, limit), limit] per element; 0 where limit is 0."""
-        floor = torch.clamp(
-            torch.full_like(limit, getattr(self.cfg, "directional_min_lin_vel", 0.0)),
-            max=limit,
-        )
+    def _sample_speed(
+        self, limit: torch.Tensor, min_speed: float | None = None
+    ) -> torch.Tensor:
+        """Uniform speed in [min(floor, limit), limit] per element; 0 where limit is 0.
+
+        ``min_speed`` overrides ``directional_min_lin_vel`` as the floor.
+        """
+        if min_speed is None:
+            min_speed = getattr(self.cfg, "directional_min_lin_vel", 0.0)
+        floor = torch.clamp(torch.full_like(limit, min_speed), max=limit)
         return floor + torch.rand_like(limit) * (limit - floor)
 
     def _sample_signed_speed(self, count: int, lo: float, hi: float) -> torch.Tensor:
@@ -242,6 +248,10 @@ class UniformVelocityCommandWithRotationCfg(UniformVelocityCommandCfg):
     """Speed floor for the forward/backward/lateral-only modes, clipped to that
     side's current range limit."""
 
+    lateral_min_lin_vel: float | None = None
+    """Speed floor for lateral-only commands, clipped to that side's range limit.
+    None falls back to ``directional_min_lin_vel``."""
+
     def build(self, env: ManagerBasedRlEnv) -> UniformVelocityCommandWithRotation:
         return UniformVelocityCommandWithRotation(self, env)
 
@@ -249,6 +259,34 @@ class UniformVelocityCommandWithRotationCfg(UniformVelocityCommandCfg):
 ############################ REWARDS ##############################
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+def set_soft_joint_pos_limit_margin(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    margin: float,
+    max_range_fraction: float = 0.05,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Set soft joint limits to the hard limits pulled in by a fixed margin.
+
+    mjlab derives soft limits from one ``soft_joint_pos_limit_factor`` scaled
+    by each joint's range, so wide joints get wide margins (13deg on the
+    elbows at 0.9). This replaces that with ``min(margin, max_range_fraction *
+    range)`` per side: ``margin`` for most joints, while narrow joints keep the
+    smaller factor-based inset so their default pose stays inside. The soft
+    limits feed both ``joint_pos_limits`` (dof_pos_limits) and the reset clamp
+    in ``reset_joints_by_offset``. Unlimited joints are left untouched.
+    """
+    del env_ids  # Soft limits are shared model data; set for every env.
+    asset: Entity = env.scene[asset_cfg.name]
+    hard = asset.data.joint_pos_limits
+    soft = asset.data.soft_joint_pos_limits
+    lo, hi = hard[..., 0], hard[..., 1]
+    finite = torch.isfinite(lo) & torch.isfinite(hi)
+    inset = torch.clamp((hi - lo) * max_range_fraction, max=margin)
+    soft[..., 0] = torch.where(finite, lo + inset, soft[..., 0])
+    soft[..., 1] = torch.where(finite, hi - inset, soft[..., 1])
 
 
 def default_joint_pose_exp(
@@ -535,8 +573,71 @@ def foot_base_heading_error_penalty(
     return cosine_error.mean(dim=-1)
 
 
+def _single_foot_airborne(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    """[B] bool: exactly one foot is off the ground (a swing, not a hop or drop)."""
+    sensor: ContactSensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+    if found.dim() == 3:
+        found = found.any(dim=-1)
+    return (~found.bool()).sum(dim=-1) == 1
+
+
+def track_linear_velocity_airborne(
+    env: ManagerBasedRlEnv,
+    std: float,
+    command_name: str,
+    sensor_name: str,
+    command_threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """mjlab's linear tracking kernel, paid only mid-swing under a linear command.
+
+    Zero while both feet are down (or both are up), and zero when the planar
+    command is at or below ``command_threshold`` -- standing still never earns it.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command {command_name!r} not found."
+    actual = asset.data.root_link_lin_vel_b
+    xy_error = torch.sum(torch.square(command[:, :2] - actual[:, :2]), dim=1)
+    z_error = torch.square(actual[:, 2])
+    reward = torch.exp(-(xy_error + z_error) / std**2)
+    commanded = torch.norm(command[:, :2], dim=-1) > command_threshold
+    gate = commanded & _single_foot_airborne(env, sensor_name)
+    return reward * gate.float()
+
+
+def track_angular_velocity_airborne(
+    env: ManagerBasedRlEnv,
+    std: float,
+    command_name: str,
+    sensor_name: str,
+    command_threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """mjlab's angular tracking kernel, paid only mid-swing under a yaw command.
+
+    Zero while both feet are down (or both are up), and zero when the yaw-rate
+    command is at or below ``command_threshold``.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command {command_name!r} not found."
+    actual = asset.data.root_link_ang_vel_b
+    z_error = torch.square(command[:, 2] - actual[:, 2])
+    xy_error = torch.sum(torch.square(actual[:, :2]), dim=1)
+    reward = torch.exp(-(z_error + xy_error) / std**2)
+    commanded = torch.abs(command[:, 2]) > command_threshold
+    gate = commanded & _single_foot_airborne(env, sensor_name)
+    return reward * gate.float()
+
+
 class _LandingTrackingReward:
-    """Pay half of movement tracking at 3 cm clearance and half at landing."""
+    """Pay half of movement tracking at 3 cm clearance and half at landing.
+
+    Clearance only counts while the other foot is in contact.
+    """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
         sensor: ContactSensor = env.scene[cfg.params["sensor_name"]]
@@ -577,10 +678,14 @@ class _LandingTrackingReward:
 
         command_speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
         standing = command_speed <= command_threshold
+        # A step needs the other foot planted: with both feet airborne (the
+        # post-reset drop, a hop) a clearance would otherwise pay for free.
+        single_support = (in_air.sum(dim=-1) == 1).unsqueeze(-1)
         self.swing_started |= just_lifted
         newly_cleared = (
             self.swing_started
             & in_air
+            & single_support
             & (heights >= min_air_height)
             & (current_air_time <= max_air_time)
             & ~self.cleared_height
@@ -1721,6 +1826,8 @@ class swing_progress_reward:
     """Reward new lift height and a matched, alternating pair of landed swings.
 
     Holding a foot at a fixed height pays nothing after the initial rise.
+    ``lift_scale`` sizes that rise (0 -> 1 per full swing) against the pair
+    bonus, so the in-progress lift can be weighted on its own.
     Landing rewards only an alternating left/right pair; both feet must have
     cleared min_height, and the lower peak limits the pair's score.
     """
@@ -1763,6 +1870,7 @@ class swing_progress_reward:
         command_threshold: float = 0.01,
         height_std: float = 0.01,
         pair_bonus_scale: float = 5.0,
+        lift_scale: float = 1.0,
     ) -> torch.Tensor:
         if target_height <= min_height:
             raise ValueError("target_height must be greater than min_height")
@@ -1770,6 +1878,8 @@ class swing_progress_reward:
             raise ValueError("height_std must be positive")
         if pair_bonus_scale < 0.0:
             raise ValueError("pair_bonus_scale must be nonnegative")
+        if lift_scale < 0.0:
+            raise ValueError("lift_scale must be nonnegative")
 
         sensor: ContactSensor = env.scene[sensor_name]
         found = sensor.data.found
@@ -1792,7 +1902,7 @@ class swing_progress_reward:
         eligible_foot = torch.arange(2, device=contact.device).unsqueeze(0) != self.last_landed_side.unsqueeze(-1)
         single_swing = in_air.sum(dim=-1) == 1
         lift_reward = (rise * in_air.float() * eligible_foot.float()).sum(dim=-1)
-        lift_reward *= single_swing.float()
+        lift_reward *= single_swing.float() * lift_scale
 
         started = in_air & ~self.was_air
         self.valid_swing = torch.where(started, torch.ones_like(self.valid_swing), self.valid_swing)
@@ -1878,12 +1988,11 @@ class selected_action_excess_l2:
 
 
 class upper_body_excursion_penalty:
-    """Hard-style cap on how far each upper-body joint may swing off zero.
+    """Hard-style cap on how far each upper-body joint may swing off default.
 
-    All of torso_yaw, the arm joints and neck_yaw/head_pitch sit at 0.0 in
-    HOME_KEYFRAME (only the six leg joints listed there are non-zero), so
-    "off zero" and "off default" are the same thing for every joint this term
-    is meant to cover.
+    Measured from ``default_joint_pos`` (HOME_KEYFRAME), not from zero: the
+    elbows sit folded at +/-105deg there, so an absolute |q| cap would charge
+    the resting pose every step.
 
     These joints have very wide physical ranges -- torso_yaw and shoulder_yaw
     are +/-180deg, elbow_pitch is -143..120deg -- so dof_pos_limits, which only
@@ -1936,7 +2045,10 @@ class upper_body_excursion_penalty:
         del max_excursion  # Resolved once in __init__.
         asset: Entity = env.scene[asset_cfg.name]
         joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
-        excess = torch.clamp(torch.abs(joint_pos) - self.max_excursion, min=0.0)
+        default_joint_pos = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+        excess = torch.clamp(
+            torch.abs(joint_pos - default_joint_pos) - self.max_excursion, min=0.0
+        )
         return torch.sum(excess, dim=-1)
 
 
