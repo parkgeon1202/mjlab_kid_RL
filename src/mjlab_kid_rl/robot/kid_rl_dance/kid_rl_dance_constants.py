@@ -204,6 +204,13 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
     "left_ankle_pitch": -math.radians(15),
     "right_hip_pitch": math.radians(15),
     "right_ankle_pitch": math.radians(15),
+    # Arms folded forward 130deg. The elbow axes are mirrored (left +y, right
+    # -y), so forward is negative on the left and positive on the right. The
+    # fold-side elbow limit is 140deg in kid_RL_dance.xml, and the env's
+    # soft-limit startup event keeps the soft limit 7deg inside it (133deg).
+    # The arm1/arm3 convex-hull overlap this fold causes is excluded in the XML.
+    "left_elbow_pitch": -math.radians(130),
+    "right_elbow_pitch": math.radians(130),
   },
 )
 
