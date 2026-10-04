@@ -42,12 +42,13 @@ from mjlab_kid_rl.plugins import enable_step_reward_logging
 from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_dance_constants import (
   get_kid_rl_dance_robot_cfg,
 )
+from mjlab_kid_rl.tasks.mdp import upright as local_upright
 from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotationCfg,
   default_joint_pose_exp,
   set_soft_joint_pos_limit_margin,
-  track_angular_velocity_airborne,
-  track_linear_velocity_airborne,
+  track_angular_velocity_commanded,
+  track_linear_velocity_commanded,
   airborne_foot_arm_swing_reward,
   feet_distance_penalty,
   base_height_penalty,
@@ -65,6 +66,7 @@ from mjlab_kid_rl.tasks.mdp import (
   randomize_bam_kp,
   gait_phase_swing_clearance_reward,
   swing_progress_reward,
+  gait_duration_symmetry_reward,
   gait_symmetry_reward,
   velocity_shortfall_penalty,
   relative_angular_velocity_error_penalty,
@@ -84,7 +86,6 @@ from mjlab_kid_rl.tasks.mdp import (
   upper_body_excursion_penalty,
   settled_standing_penalty,
 )
-from mjlab_kid_rl.tasks.mdp import upright as local_upright
 from mjlab_kid_rl.tasks.symmetry import compute_symmetric_states
 
 ##
@@ -784,24 +785,22 @@ def make_kid_rl_velocity_env_cfg(
   walking_threshold = 0.01
   max_swing_time = 0.7
 
-  # Velocity tracking pays only while exactly one foot is in the air, and only
-  # for a nonzero command on that axis: linear needs a planar command, angular
-  # a yaw-rate command. Standing still -- or holding still on an axis that is
-  # commanded zero -- earns nothing from these terms.
-  # The linear std is tight (sqrt(0.025)): ignoring a 0.2 m/s command scores
-  # 20% instead of 67% on the steps that do pay.
-  cfg.rewards["track_linear_velocity"].func = track_linear_velocity_airborne
+  # mjlab's tracking kernels, paid every step -- except that an axis whose
+  # command is zero pays nothing: linear needs a planar command, angular a
+  # yaw-rate command, so holding still on an uncommanded axis earns nothing.
+  # The linear std is sqrt(0.1): wide enough that a partial move toward the
+  # command already raises the reward (sqrt(0.025) was flat near zero speed,
+  # so stepping in place collected almost as much as moving).
+  cfg.rewards["track_linear_velocity"].func = track_linear_velocity_commanded
   cfg.rewards["track_linear_velocity"].params = {
     "command_name": "twist",
-    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
     "command_threshold": walking_threshold,
-    "std": np.sqrt(0.025),
+    "std": np.sqrt(0.1),
   }
   cfg.rewards["track_linear_velocity"].weight = 3.0
-  cfg.rewards["track_angular_velocity"].func = track_angular_velocity_airborne
+  cfg.rewards["track_angular_velocity"].func = track_angular_velocity_commanded
   cfg.rewards["track_angular_velocity"].params = {
     "command_name": "twist",
-    "sensor_name": FEET_GROUND_SENSOR_CFG.name,
     "command_threshold": walking_threshold,
     "std": np.sqrt(0.2),
   }
@@ -820,7 +819,7 @@ def make_kid_rl_velocity_env_cfg(
   # neck/head stay tight in every band: the head carries no gait function here, so
   # the pose term's job is just to stop the policy from flailing it around.
   std_standing = {
-    r".*torso_yaw.*": 0.0,
+    r".*torso_yaw.*": 0.1,
     r".*shoulder_pitch.*": 0.1,
     r".*shoulder_roll.*": 0.1,
     r".*shoulder_yaw.*": 0.1,
@@ -885,7 +884,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["pose"].params["std_running"] = std_running
   cfg.rewards["pose"].params["walking_threshold"] = walking_threshold
   cfg.rewards["pose"].params["running_threshold"] = running_threshold
-  cfg.rewards["pose"].weight = 1.0
+  cfg.rewards["pose"].weight = 0.0
 
   # Reward proximity to HOME_KEYFRAME during stand commands.
   # The target comes from robot.data.default_joint_pos; walking is unaffected.
@@ -910,7 +909,7 @@ def make_kid_rl_velocity_env_cfg(
   # almost nothing (Episode_Reward/upright ~0.03) next to termination (~-0.99)
   # and self_collisions (~-0.62) -- doubling it to push staying-upright harder
   # before the policy ever gets punished for falling.
-  cfg.rewards["upright"].weight = 1.0
+  cfg.rewards["upright"].weight = 0.0
 
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("base_link",)
   cfg.rewards["body_ang_vel"].weight = -0.05
@@ -938,10 +937,13 @@ def make_kid_rl_velocity_env_cfg(
     "threshold_max": max_swing_time,
     "command_name": "twist",
     "command_threshold": walking_threshold,
+    "ramp_from": 0.0,
   }
   # Pay every step while exactly one foot has been airborne for 0.3--0.7 s.
+  # Before 0.3 s the per-step pay ramps linearly from 0 (just lifted) to 1, so
+  # a short swing still earns more the longer the foot stays up.
   # Landing and overlong swings receive no air-time reward.
-  cfg.rewards["air_time"].weight = 5.0
+  cfg.rewards["air_time"].weight = 3.0
   cfg.rewards["both_feet_airborne"] = RewardTermCfg(
     func=both_feet_airborne_penalty,
     weight=-3.0,
@@ -987,9 +989,10 @@ def make_kid_rl_velocity_env_cfg(
       "min_duration_s": 1.0,
     },
   )
-  # Independently charge each foot that has not lost ground contact for 2 s
-  # under a walking command. RewardManager multiplies by step_dt=0.02, so
-  # weight=-500 gives an actual one-step cost of -10 per overdue foot.
+  # Charge every step for each foot that has stayed down longer than 2 s under
+  # a walking command, until that foot lifts. RewardManager multiplies by
+  # step_dt=0.02, so weight=-2 costs -0.04 per step, i.e. -2 per second, per
+  # overdue foot.
   cfg.rewards["not_stepping_each_foot"] = RewardTermCfg(
     func=not_stepping_each_foot_penalty,
     weight=-10.0,
@@ -1187,33 +1190,38 @@ def make_kid_rl_velocity_env_cfg(
   # of landed swings. Holding one foot up does not pay each step.
   cfg.rewards["swing_progress"] = RewardTermCfg(
     func=swing_progress_reward,
-    weight=10.0,
+    weight=5.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
-      # Start paying 2 mm after lift-off (just above contact chatter) instead
-      # of 5 mm, so the very first part of a lift already earns reward.
-      "min_height": 0.002,
+      "min_height": 0.005,
       "target_height": 0.03,
       "command_name": "twist",
       "command_threshold": walking_threshold,
       "height_std": 0.01,
       "pair_bonus_scale": 5.0,
+      # Half the alternation bonus is paid gradually as the opposite foot
+      # rises (from lift-off, not only at 3 cm); the other half at landing.
+      "pair_lift_fraction": 0.5,
       # The rise toward 3 cm is the in-progress signal a policy can find by
-      # exploration. A full lift pays weight * lift_scale * dt = 10 * 20 *
-      # 0.02 = 4.0, equal to what a fall costs (termination -200 * dt). At
-      # 40 (8.0 per lift) the policy flailed its legs and fell every ~2.7 s.
-      "lift_scale": 20.0,
+      # exploration; size it like the pair bonus (full swing = 5) rather than
+      # 5x smaller, so partial lifts are worth chasing before a full
+      # alternating gait exists.
+      "lift_scale": 5.0,
     },
   )
 
   cfg.rewards["same_foot_repeat"] = RewardTermCfg(
     func=same_foot_repeat_penalty,
-    weight=-10.0,
+    weight=-50.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      # Charge a landing on the same foot again, and also a landing by the
+      # opposite foot whose swing lasted < 0.3 s; only a >= 0.3 s opposite
+      # swing counts as a proper alternating step.
+      "min_air_time": 0.3,
     },
   )
 
@@ -1231,7 +1239,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=5.0,
+    weight=10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1244,6 +1252,26 @@ def make_kid_rl_velocity_env_cfg(
       "duration_std": 0.1,
       "length_std": 0.05,
       "min_double_air_time_s": 0.06,
+    },
+  )
+
+  # Separate term scored only on how closely the left and right swing
+  # durations match (step length is not compared). 0.1 s of swing-time
+  # mismatch reads as "clearly limping" (score 1/e). It also subtracts
+  # double_flight_penalty on every step both feet are in the air at once under
+  # a moving command.
+  cfg.rewards["gait_duration_symmetry"] = RewardTermCfg(
+    func=gait_duration_symmetry_reward,
+    weight=50.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "duration_std": 0.1,
+      "min_double_air_time_s": 0.06,
+      "double_flight_penalty": 1.0,
+      "double_flight_min_time": 0.0,
     },
   )
 
@@ -1741,7 +1769,7 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     value_loss_coef=1.0,
     use_clipped_value_loss=True,
     clip_param=0.2,
-    entropy_coef=0.005,
+    entropy_coef=0.01,
     num_learning_epochs=5,
     num_mini_batches=4,
     # A fixed, conservative rate prevents KL spikes from repeatedly pinning

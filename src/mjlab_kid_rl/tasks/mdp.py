@@ -20,6 +20,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 from mjlab.utils.lab_api.string import resolve_matching_names_values
+from mjlab.tasks.velocity.mdp.rewards import variable_posture as _variable_posture
 from mjlab.tasks.velocity.mdp.velocity_command import (
     UniformVelocityCommand,
     UniformVelocityCommandCfg,
@@ -415,6 +416,81 @@ class upright:
         del env_ids  # Unused.
 
 
+def _moving_without_swing(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str,
+    command_threshold: float,
+    max_air_time: float = 0.7,
+) -> torch.Tensor:
+    """[B] bool: a moving command is active but no alternating swing is under way."""
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
+    return (speed > command_threshold) & ~_alternating_swing(env, sensor_name, max_air_time)
+
+
+class upright_swing_gated(upright):
+    """``upright``, but under a moving command it pays only during an alternating swing.
+
+    Stand commands keep the ordinary every-step reward. Under a moving command
+    it pays only while the foot opposite the last landing is up, for at most
+    ``max_air_time`` (see ``_alternating_swing``): standing still, holding one
+    foot up, or re-lifting the same foot earns nothing.
+    """
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        std: float,
+        sensor_name: str,
+        pitch: float = 0.0,
+        standing_pitch: float | None = None,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        command_name: str = "twist",
+        command_threshold: float = 0.05,
+        max_air_time: float = 0.7,
+    ) -> torch.Tensor:
+        reward = super().__call__(
+            env, std, pitch, standing_pitch, asset_cfg, command_name, command_threshold
+        )
+        blocked = _moving_without_swing(
+            env, sensor_name, command_name, command_threshold, max_air_time
+        )
+        return reward * (~blocked).float()
+
+
+class variable_posture_swing_gated(_variable_posture):
+    """mjlab's ``variable_posture``, but under a moving command it pays only mid-swing.
+
+    Stand commands keep the ordinary every-step reward. Under a moving command
+    (speed above ``walking_threshold``) it pays only during an alternating
+    swing, as in ``upright_swing_gated``.
+    """
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        std_standing,
+        std_walking,
+        std_running,
+        asset_cfg: SceneEntityCfg,
+        command_name: str,
+        sensor_name: str,
+        walking_threshold: float = 0.5,
+        running_threshold: float = 1.5,
+        max_air_time: float = 0.7,
+    ) -> torch.Tensor:
+        reward = super().__call__(
+            env, std_standing, std_walking, std_running, asset_cfg, command_name,
+            walking_threshold, running_threshold,
+        )
+        blocked = _moving_without_swing(
+            env, sensor_name, command_name, walking_threshold, max_air_time
+        )
+        return reward * (~blocked).float()
+
+
 def feet_distance_penalty(
     env: ManagerBasedRlEnv,
     min_dist: float,
@@ -573,28 +649,51 @@ def foot_base_heading_error_penalty(
     return cosine_error.mean(dim=-1)
 
 
-def _single_foot_airborne(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
-    """[B] bool: exactly one foot is off the ground (a swing, not a hop or drop)."""
+def _alternating_swing(
+    env: ManagerBasedRlEnv, sensor_name: str, max_air_time: float = 0.7
+) -> torch.Tensor:
+    """[B] bool: an alternating step is in its swing.
+
+    True when exactly one foot is off the ground, it has been up for at most
+    ``max_air_time``, and the planted foot landed no earlier than the swing
+    foot's own previous landing -- i.e. the swing foot is the opposite of the
+    last foot to land. Holding one foot up (past ``max_air_time``) or lifting
+    the same foot again after it lands is False. Right after a reset both feet
+    landed together, so the first swing with either foot counts.
+    """
     sensor: ContactSensor = env.scene[sensor_name]
     found = sensor.data.found
-    assert found is not None
+    current_air_time = sensor.data.current_air_time
+    current_contact_time = sensor.data.current_contact_time
+    last_contact_time = sensor.data.last_contact_time
+    assert found is not None and current_air_time is not None
+    assert current_contact_time is not None and last_contact_time is not None
     if found.dim() == 3:
         found = found.any(dim=-1)
-    return (~found.bool()).sum(dim=-1) == 1
+    in_air = ~found.bool()  # [B, 2]
+    single = in_air.sum(dim=-1) == 1
+    swing = in_air.long().argmax(dim=-1, keepdim=True)  # [B, 1]
+    stance = 1 - swing
+    swing_air = current_air_time.gather(-1, swing).squeeze(-1)
+    # Time since each foot last touched down.
+    since_swing_landed = swing_air + last_contact_time.gather(-1, swing).squeeze(-1)
+    since_stance_landed = current_contact_time.gather(-1, stance).squeeze(-1)
+    tol = 0.5 * env.step_dt
+    opposite = since_stance_landed <= since_swing_landed + tol
+    return single & (swing_air <= max_air_time) & opposite
 
 
-def track_linear_velocity_airborne(
+def track_linear_velocity_commanded(
     env: ManagerBasedRlEnv,
     std: float,
     command_name: str,
-    sensor_name: str,
     command_threshold: float = 0.01,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """mjlab's linear tracking kernel, paid only mid-swing under a linear command.
+    """mjlab's linear tracking kernel, every step, but zero under a zero planar command.
 
-    Zero while both feet are down (or both are up), and zero when the planar
-    command is at or below ``command_threshold`` -- standing still never earns it.
+    Holding still while the planar command is at or below ``command_threshold``
+    (pure rotation or stand commands) earns nothing from this term.
     """
     asset: Entity = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
@@ -604,7 +703,56 @@ def track_linear_velocity_airborne(
     z_error = torch.square(actual[:, 2])
     reward = torch.exp(-(xy_error + z_error) / std**2)
     commanded = torch.norm(command[:, :2], dim=-1) > command_threshold
-    gate = commanded & _single_foot_airborne(env, sensor_name)
+    return reward * commanded.float()
+
+
+def track_angular_velocity_commanded(
+    env: ManagerBasedRlEnv,
+    std: float,
+    command_name: str,
+    command_threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """mjlab's angular tracking kernel, every step, but zero under a zero yaw command.
+
+    Not turning while the yaw-rate command is at or below ``command_threshold``
+    earns nothing from this term.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command {command_name!r} not found."
+    actual = asset.data.root_link_ang_vel_b
+    z_error = torch.square(command[:, 2] - actual[:, 2])
+    xy_error = torch.sum(torch.square(actual[:, :2]), dim=1)
+    reward = torch.exp(-(z_error + xy_error) / std**2)
+    commanded = torch.abs(command[:, 2]) > command_threshold
+    return reward * commanded.float()
+
+
+def track_linear_velocity_airborne(
+    env: ManagerBasedRlEnv,
+    std: float,
+    command_name: str,
+    sensor_name: str,
+    command_threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    max_air_time: float = 0.7,
+) -> torch.Tensor:
+    """mjlab's linear tracking kernel, paid only during an alternating swing.
+
+    Pays while the foot opposite the last landing is up (for at most
+    ``max_air_time``) and the planar command is above ``command_threshold``;
+    standing still, holding one foot up or re-lifting the same foot earns nothing.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command {command_name!r} not found."
+    actual = asset.data.root_link_lin_vel_b
+    xy_error = torch.sum(torch.square(command[:, :2] - actual[:, :2]), dim=1)
+    z_error = torch.square(actual[:, 2])
+    reward = torch.exp(-(xy_error + z_error) / std**2)
+    commanded = torch.norm(command[:, :2], dim=-1) > command_threshold
+    gate = commanded & _alternating_swing(env, sensor_name, max_air_time)
     return reward * gate.float()
 
 
@@ -615,11 +763,12 @@ def track_angular_velocity_airborne(
     sensor_name: str,
     command_threshold: float = 0.01,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    max_air_time: float = 0.7,
 ) -> torch.Tensor:
-    """mjlab's angular tracking kernel, paid only mid-swing under a yaw command.
+    """mjlab's angular tracking kernel, paid only during an alternating swing.
 
-    Zero while both feet are down (or both are up), and zero when the yaw-rate
-    command is at or below ``command_threshold``.
+    Same gate as ``track_linear_velocity_airborne``, under a yaw-rate command
+    above ``command_threshold``.
     """
     asset: Entity = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
@@ -629,7 +778,7 @@ def track_angular_velocity_airborne(
     xy_error = torch.sum(torch.square(actual[:, :2]), dim=1)
     reward = torch.exp(-(z_error + xy_error) / std**2)
     commanded = torch.abs(command[:, 2]) > command_threshold
-    gate = commanded & _single_foot_airborne(env, sensor_name)
+    gate = commanded & _alternating_swing(env, sensor_name, max_air_time)
     return reward * gate.float()
 
 
@@ -793,6 +942,10 @@ class same_foot_repeat_penalty:
         command_name: Velocity command to gate on. A standing robot should not
             be stepping at all, which is no_stepping's job, not this term's.
         command_threshold: Below this commanded speed the term is switched off.
+        min_air_time: A landing by the opposite foot after less than this much
+            air time is charged like a repeat; only an opposite-foot swing of
+            at least this long is a proper alternating step. Landing on the
+            same foot again is charged regardless of air time.
     """
 
     _NONE = -1  # no foot has landed yet this episode
@@ -813,6 +966,7 @@ class same_foot_repeat_penalty:
         sensor_name: str,
         command_name: str = "twist",
         command_threshold: float = 0.05,
+        min_air_time: float = 0.0,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_landed = sensor.compute_first_contact(dt=env.step_dt)  # [B, F] bool
@@ -823,7 +977,15 @@ class same_foot_repeat_penalty:
         # meaningful where exactly one foot landed, which `single` masks for.
         landed_idx = torch.argmax(just_landed.long(), dim=-1)  # [B]
 
-        repeat = single & (self.last_foot >= 0) & (landed_idx == self.last_foot)
+        same_foot = landed_idx == self.last_foot
+        if min_air_time > 0.0:
+            # The opposite foot only counts as a proper step if it was up for
+            # at least min_air_time; a shorter swing is charged like a repeat.
+            last_air_time = sensor.data.last_air_time
+            assert last_air_time is not None
+            landed_air = last_air_time.gather(-1, landed_idx.unsqueeze(-1)).squeeze(-1)
+            same_foot = same_foot | (landed_air < min_air_time)
+        repeat = single & (self.last_foot >= 0) & same_foot
         penalty = repeat.float()
 
         # Two feet landing on the same control step is a hop, not an
@@ -935,6 +1097,7 @@ class gait_symmetry_reward:
         duration_std: float = 0.1,
         length_std: float = 0.05,
         min_double_air_time_s: float = 0.06,
+        match_length: bool = True,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_lifted = sensor.compute_first_air(dt=env.step_dt)  # [B, F]
@@ -1000,7 +1163,10 @@ class gait_symmetry_reward:
         # upright, pose, forward_step).
         duration_score = torch.exp(-((duration_gap / duration_std) ** 2))
         length_score = torch.exp(-((length_gap / length_std) ** 2))
-        reward = 0.5 * (duration_score + length_score)
+        if match_length:
+            reward = 0.5 * (duration_score + length_score)
+        else:
+            reward = duration_score
         reward = reward * (alternating & both_stepped).float()
         self.last_landed_side = torch.where(
             single_landing, landed_side,
@@ -1641,8 +1807,16 @@ def feet_air_time_continuous_reward(
     threshold_max: float = 0.7,
     command_name: str = "twist",
     command_threshold: float = 0.01,
+    ramp_from: float | None = None,
 ) -> torch.Tensor:
-    """Reward each step of single-foot swing within the allowed air-time range."""
+    """Reward each step of single-foot swing within the allowed air-time range.
+
+    Pays 1 per step while the swing foot's air time is in
+    [threshold_min, threshold_max] and 0 past threshold_max. With
+    ``ramp_from`` set, air time below threshold_min is no longer worth 0: it
+    pays a linear ramp from 0 at ``ramp_from`` up to 1 at threshold_min, so a
+    swing that is still too short earns more the longer the foot stays up.
+    """
     sensor: ContactSensor = env.scene[sensor_name]
     current_air_time = sensor.data.current_air_time
     found = sensor.data.found
@@ -1651,17 +1825,24 @@ def feet_air_time_continuous_reward(
         found = found.any(dim=-1)
     in_air = ~found.bool()
     single_swing = in_air.sum(dim=-1) == 1
-    valid_duration = (current_air_time >= threshold_min) & (
-        current_air_time <= threshold_max
-    )
+    if ramp_from is None:
+        duration_score = (
+            (current_air_time >= threshold_min) & (current_air_time <= threshold_max)
+        ).float()
+    else:
+        if ramp_from >= threshold_min:
+            raise ValueError("ramp_from must be below threshold_min")
+        ramp = (current_air_time - ramp_from) / (threshold_min - ramp_from)
+        duration_score = ramp.clamp(0.0, 1.0) * (
+            current_air_time <= threshold_max
+        ).float()
+    swing_score = (duration_score * in_air.float()).amax(dim=-1)
 
     command = env.command_manager.get_command(command_name)
     assert command is not None
     cmd_speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
     active = cmd_speed > command_threshold
-    return (in_air & valid_duration).any(dim=-1).float() * (
-        single_swing & active
-    ).float()
+    return swing_score * (single_swing & active).float()
 
 
 def both_feet_airborne_penalty(
@@ -1771,10 +1952,11 @@ class not_stepping_penalty:
 
 
 class not_stepping_each_foot_penalty:
-    """Charge once per two-second interval when a commanded foot never lifts.
+    """Charge every step a commanded foot has stayed down longer than the limit.
 
-    Each foot has its own timer. Losing ground contact resets only that foot's
-    timer. The term returns one for each foot whose two-second timer expires.
+    Each foot has its own timer. Once a foot has gone ``max_time_without_lift_s``
+    under a moving command without leaving the ground, it is charged 1 on every
+    step until it lifts; losing ground contact resets only that foot's timer.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
@@ -1815,10 +1997,6 @@ class not_stepping_each_foot_penalty:
             torch.zeros_like(self.steps_without_lift),
         )
         overdue = self.steps_without_lift * env.step_dt >= max_time_without_lift_s
-        # A still-planted foot is charged again only after another full interval.
-        self.steps_without_lift = torch.where(
-            overdue, torch.zeros_like(self.steps_without_lift), self.steps_without_lift
-        )
         return overdue.sum(dim=-1).float()
 
 
@@ -1828,6 +2006,9 @@ class swing_progress_reward:
     Holding a foot at a fixed height pays nothing after the initial rise.
     ``lift_scale`` sizes that rise (0 -> 1 per full swing) against the pair
     bonus, so the in-progress lift can be weighted on its own.
+    ``pair_lift_fraction`` moves that share of the pair bonus from the landing
+    to the opposite foot's rise: it is paid gradually as the alternating foot
+    lifts (scaled by the previous swing's peak), the rest still at landing.
     Landing rewards only an alternating left/right pair; both feet must have
     cleared min_height, and the lower peak limits the pair's score.
     """
@@ -1848,10 +2029,15 @@ class swing_progress_reward:
         self.last_landed_side = torch.full(
             (found.shape[0],), -1, dtype=torch.long, device=found.device
         )
+        # Whether the most recent single-foot landing ended a real swing.
+        self.last_landing_valid = torch.zeros(
+            (found.shape[0],), dtype=torch.bool, device=found.device
+        )
 
     def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
         if env_ids is None:
             env_ids = slice(None)
+        self.last_landing_valid[env_ids] = False
         self.current_peak[env_ids] = 0.0
         self.last_peak[env_ids] = 0.0
         self.has_completed[env_ids] = False
@@ -1871,6 +2057,7 @@ class swing_progress_reward:
         height_std: float = 0.01,
         pair_bonus_scale: float = 5.0,
         lift_scale: float = 1.0,
+        pair_lift_fraction: float = 0.0,
     ) -> torch.Tensor:
         if target_height <= min_height:
             raise ValueError("target_height must be greater than min_height")
@@ -1880,6 +2067,8 @@ class swing_progress_reward:
             raise ValueError("pair_bonus_scale must be nonnegative")
         if lift_scale < 0.0:
             raise ValueError("lift_scale must be nonnegative")
+        if not 0.0 <= pair_lift_fraction <= 1.0:
+            raise ValueError("pair_lift_fraction must be in [0, 1]")
 
         sensor: ContactSensor = env.scene[sensor_name]
         found = sensor.data.found
@@ -1901,8 +2090,23 @@ class swing_progress_reward:
         # A repeat by the last landing foot cannot collect another lift reward.
         eligible_foot = torch.arange(2, device=contact.device).unsqueeze(0) != self.last_landed_side.unsqueeze(-1)
         single_swing = in_air.sum(dim=-1) == 1
-        lift_reward = (rise * in_air.float() * eligible_foot.float()).sum(dim=-1)
-        lift_reward *= single_swing.float() * lift_scale
+        eligible_rise = (rise * in_air.float() * eligible_foot.float()).sum(dim=-1)
+        eligible_rise *= single_swing.float()
+        lift_reward = eligible_rise * lift_scale
+
+        # Lift-time share of the pair bonus: once the previous foot finished a
+        # real swing, the opposite foot earns it gradually as it rises, scaled
+        # by how high that previous swing went.
+        prev_side = self.last_landed_side.clamp(min=0).unsqueeze(-1)
+        prev_peak_progress = (
+            (self.last_peak.gather(-1, prev_side).squeeze(-1) - min_height)
+            / (target_height - min_height)
+        ).clamp(0.0, 1.0)
+        prev_swing_ok = self.last_landing_valid & (self.last_landed_side >= 0)
+        pair_lift_reward = (
+            pair_lift_fraction * pair_bonus_scale * eligible_rise
+            * prev_peak_progress * prev_swing_ok.float()
+        )
 
         started = in_air & ~self.was_air
         self.valid_swing = torch.where(started, torch.ones_like(self.valid_swing), self.valid_swing)
@@ -1921,8 +2125,18 @@ class swing_progress_reward:
         lower_peak_progress = peak_progress.min(dim=-1).values
         height_gap = self.last_peak[:, 0] - self.last_peak[:, 1]
         height_match = torch.exp(-0.5 * (height_gap / height_std).square())
-        pair_reward = pair_bonus_scale * lower_peak_progress * height_match
+        pair_reward = (1.0 - pair_lift_fraction) * pair_bonus_scale * lower_peak_progress * height_match
         pair_reward *= (alternating & both_completed).float()
+        landed_peak = previous_peak.gather(-1, landed_side.unsqueeze(-1)).squeeze(-1)
+        self.last_landing_valid = torch.where(
+            single_landing,
+            valid_landing.any(dim=-1) & (landed_peak > min_height),
+            torch.where(
+                landed.sum(dim=-1) > 1,
+                torch.zeros_like(self.last_landing_valid),
+                self.last_landing_valid,
+            ),
+        )
         self.last_landed_side = torch.where(single_landing, landed_side, self.last_landed_side)
         self.last_landed_side = torch.where(
             landed.sum(dim=-1) > 1,
@@ -1936,7 +2150,7 @@ class swing_progress_reward:
         command = env.command_manager.get_command(command_name)
         assert command is not None
         speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
-        return (lift_reward + pair_reward) * (speed > command_threshold).float()
+        return (lift_reward + pair_lift_reward + pair_reward) * (speed > command_threshold).float()
 
 def base_height_penalty(
     env: ManagerBasedRlEnv,
@@ -2334,6 +2548,52 @@ class feet_crossing_reward:
             self.rewarded_this_swing | newly_reached,
         )
         return crossed.float() + alternation_bonus * completed_pair.float()
+
+
+class gait_duration_symmetry_reward(gait_symmetry_reward):
+    """``gait_symmetry_reward`` scored on swing duration alone.
+
+    Same step bookkeeping (alternating single-foot landings, hops invalidate,
+    both legs need a completed step on record), but the score is only
+    exp(-(duration_gap / duration_std)^2): left and right swings should last
+    equally long, whatever distance each foot covers.
+
+    Under a moving command it also subtracts ``double_flight_penalty`` on
+    every step both feet are off the ground for at least
+    ``double_flight_min_time`` -- a swing must have its other foot planted.
+    """
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        asset_cfg: SceneEntityCfg,
+        command_name: str = "twist",
+        command_threshold: float = 0.05,
+        duration_std: float = 0.1,
+        min_double_air_time_s: float = 0.06,
+        double_flight_penalty: float = 1.0,
+        double_flight_min_time: float = 0.0,
+    ) -> torch.Tensor:
+        reward = super().__call__(
+            env, sensor_name, asset_cfg, command_name, command_threshold,
+            duration_std=duration_std, min_double_air_time_s=min_double_air_time_s,
+            match_length=False,
+        )
+        sensor: ContactSensor = env.scene[sensor_name]
+        found = sensor.data.found
+        current_air_time = sensor.data.current_air_time
+        assert found is not None and current_air_time is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        both_up = (~found.bool()).all(dim=-1) & (
+            current_air_time >= double_flight_min_time
+        ).all(dim=-1)
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
+        moving = speed > command_threshold
+        return reward - double_flight_penalty * (both_up & moving).float()
 
 
 def self_collision_cost_excluding_linkage(
