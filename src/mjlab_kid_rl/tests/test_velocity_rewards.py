@@ -687,14 +687,15 @@ class TestNotSteppingEachFootPenalty(unittest.TestCase):
       max_time_without_lift_s=2.0,
     )
 
-  def test_each_overdue_foot_emits_once_per_interval(self) -> None:
+  def test_each_overdue_foot_is_charged_every_step_until_it_lifts(self) -> None:
     for _ in range(99):
       torch.testing.assert_close(self._penalty(), torch.zeros(1))
-    torch.testing.assert_close(self._penalty(), torch.tensor([2.0]))
-    torch.testing.assert_close(self._penalty(), torch.zeros(1))
-    for _ in range(98):
-      self._penalty()
-    torch.testing.assert_close(self._penalty(), torch.tensor([2.0]))
+    for _ in range(50):
+      torch.testing.assert_close(self._penalty(), torch.tensor([2.0]))
+    self.contact.data.found[0, 0] = False
+    torch.testing.assert_close(self._penalty(), torch.tensor([1.0]))
+    self.contact.data.found[0, 0] = True
+    torch.testing.assert_close(self._penalty(), torch.tensor([1.0]))
 
   def test_contact_loss_resets_only_that_foot(self) -> None:
     for _ in range(90):
