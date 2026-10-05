@@ -127,7 +127,10 @@ MX64V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
   target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
-  kp_fw=46,
+  # 46 -> 25 (2026-10-05): fitted to an airborne real log (air1005.csv, firmware kp 46).
+  # Replaying the real targets open-loop, the hip yaws tracked 1.59x too far at 46;
+  # position RMS error is lowest at 0.55x. The real firmware gain stays 46.
+  kp_fw=25,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
@@ -204,6 +207,13 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
     "left_ankle_pitch": -math.radians(15),
     "right_hip_pitch": math.radians(15),
     "right_ankle_pitch": math.radians(15),
+    # Arms folded forward 130deg. The elbow axes are mirrored (left +y, right
+    # -y), so forward is negative on the left and positive on the right. The
+    # fold-side elbow limit is 140deg in kid_RL_dance.xml, and the env's
+    # soft-limit startup event keeps the soft limit 7deg inside it (133deg).
+    # The arm1/arm3 convex-hull overlap this fold causes is excluded in the XML.
+    "left_elbow_pitch": -math.radians(130),
+    "right_elbow_pitch": math.radians(130),
   },
 )
 

@@ -251,6 +251,34 @@ class UniformVelocityCommandWithRotationCfg(UniformVelocityCommandCfg):
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
+def set_soft_joint_pos_limit_margin(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    margin: float,
+    max_range_fraction: float = 0.05,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Set soft joint limits to the hard limits pulled in by a fixed margin.
+
+    mjlab derives soft limits from one ``soft_joint_pos_limit_factor`` scaled
+    by each joint's range, so wide joints get wide margins (13deg on the
+    elbows at 0.9). This replaces that with ``min(margin, max_range_fraction *
+    range)`` per side: ``margin`` for most joints, while narrow joints keep the
+    smaller factor-based inset so their default pose stays inside. The soft
+    limits feed both ``joint_pos_limits`` (dof_pos_limits) and the reset clamp
+    in ``reset_joints_by_offset``. Unlimited joints are left untouched.
+    """
+    del env_ids  # Soft limits are shared model data; set for every env.
+    asset: Entity = env.scene[asset_cfg.name]
+    hard = asset.data.joint_pos_limits
+    soft = asset.data.soft_joint_pos_limits
+    lo, hi = hard[..., 0], hard[..., 1]
+    finite = torch.isfinite(lo) & torch.isfinite(hi)
+    inset = torch.clamp((hi - lo) * max_range_fraction, max=margin)
+    soft[..., 0] = torch.where(finite, lo + inset, soft[..., 0])
+    soft[..., 1] = torch.where(finite, hi - inset, soft[..., 1])
+
+
 def default_joint_pose_exp(
     env: ManagerBasedRlEnv,
     std: float,
@@ -963,6 +991,165 @@ def lateral_symmetry_penalty(
     return penalty
 
 
+class lateral_swing_progress_reward:
+    """Reward new sideways ground gained by the swing foot and by the base, as it happens.
+
+    The lateral counterpart of ``swing_progress_reward``'s lift term. Under a
+    lateral command it pays, per step, the *increase* in two progress measures,
+    each normalised by the target step
+
+        target = clamp(|vy_cmd| * nominal_cycle_time, min_target, max_target)
+
+    - foot: how far the airborne foot is past its own furthest previous landing
+      along the commanded lateral direction (0 -> 1 over one target step). Only
+      while exactly one foot is in the air, and only for the foot opposite the
+      last one to land.
+    - base: how far the base link is past its own furthest previous position
+      along that direction, scaled by ``base_scale`` (1.0 per target distance).
+
+    Both count only while a foot is lifted clear -- at least ``min_swing_height``
+    above the ground with the other foot planted -- so skimming or dragging a
+    foot sideways, or sliding on both feet, earns nothing.
+
+    Both are high-water marks: reaching a leg out and bringing it back, or
+    swaying the trunk side to side, gains no new ground and so pays nothing the
+    second time. The marks restart whenever the lateral command switches sign or
+    turns on. The foot's lateral axis is frozen at its liftoff (as in
+    ``forward_step_reward``) so yawing mid-swing is not mistaken for travel.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        asset: Entity = env.scene[asset_cfg.name]
+        num_feet = len(asset.find_sites(asset_cfg.site_names)[0])
+        if num_feet != 2:
+            raise ValueError("lateral_swing_progress_reward requires left and right foot sites")
+        self.foot_anchor_xy = torch.zeros((env.num_envs, 2, 2), device=env.device)
+        self.base_anchor_xy = torch.zeros((env.num_envs, 2), device=env.device)
+        self.anchor_sign = torch.zeros(env.num_envs, device=env.device)
+        self.liftoff_lateral_xy = torch.zeros((env.num_envs, 2, 2), device=env.device)
+        self.liftoff_lateral_xy[..., 1] = 1.0
+        self.peak_progress = torch.zeros((env.num_envs, 2), device=env.device)
+        self.was_air = torch.zeros((env.num_envs, 2), dtype=torch.bool, device=env.device)
+        self.last_landed_side = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self.foot_anchor_xy[env_ids] = 0.0
+        self.base_anchor_xy[env_ids] = 0.0
+        self.anchor_sign[env_ids] = 0.0  # forces the marks to restart
+        self.liftoff_lateral_xy[env_ids] = 0.0
+        self.liftoff_lateral_xy[env_ids, :, 1] = 1.0
+        self.peak_progress[env_ids] = 0.0
+        self.was_air[env_ids] = False
+        self.last_landed_side[env_ids] = -1
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        asset_cfg: SceneEntityCfg,
+        height_sensor_name: str,
+        command_name: str = "twist",
+        command_threshold: float = 0.01,
+        nominal_cycle_time: float = 0.7,
+        min_target: float = 0.02,
+        max_target: float = 0.12,
+        base_scale: float = 1.0,
+        min_swing_height: float = 0.03,
+    ) -> torch.Tensor:
+        sensor: ContactSensor = env.scene[sensor_name]
+        found = sensor.data.found
+        assert found is not None
+        if found.dim() == 3:
+            found = found.any(dim=-1)
+        contact = found.bool()  # [B, 2] (left, right)
+        in_air = ~contact
+        started = in_air & ~self.was_air
+        landed = self.was_air & contact
+
+        asset: Entity = env.scene[asset_cfg.name]
+        foot_pos_xy = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]  # [B, 2, 2]
+        base_pos_xy = asset.data.root_link_pos_w[:, :2]  # [B, 2]
+        # Yaw-only lateral axis: world-projected body +x rotated 90 degrees.
+        local_fwd = torch.zeros((env.num_envs, 3), device=env.device)
+        local_fwd[:, 0] = 1.0
+        forward_xy = quat_apply(asset.data.root_link_quat_w, local_fwd)[:, :2]
+        forward_xy = forward_xy / forward_xy.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        lateral_now = torch.stack((-forward_xy[:, 1], forward_xy[:, 0]), dim=-1)  # [B, 2]
+
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        vy = command[:, 1]
+        active = torch.abs(vy) > command_threshold
+        sign = torch.sign(vy) * active.float()  # 0 when no lateral command
+        target = (torch.abs(vy) * nominal_cycle_time).clamp(min=min_target, max=max_target)
+
+        # Restart every high-water mark when the commanded direction changes
+        # (including turning on, and the first step after an episode reset).
+        restart = sign != self.anchor_sign
+        self.foot_anchor_xy = torch.where(restart[:, None, None], foot_pos_xy, self.foot_anchor_xy)
+        self.base_anchor_xy = torch.where(restart[:, None], base_pos_xy, self.base_anchor_xy)
+        self.peak_progress = torch.where(
+            restart[:, None], torch.zeros_like(self.peak_progress), self.peak_progress
+        )
+        self.anchor_sign = sign
+
+        self.liftoff_lateral_xy = torch.where(
+            started.unsqueeze(-1), lateral_now.unsqueeze(1).expand(-1, 2, -1), self.liftoff_lateral_xy
+        )
+
+        # Foot: ground gained past its furthest previous landing.
+        foot_travel = ((foot_pos_xy - self.foot_anchor_xy) * self.liftoff_lateral_xy).sum(dim=-1)
+        foot_travel = foot_travel * sign.unsqueeze(-1)  # + = commanded direction
+        progress = (foot_travel / target.unsqueeze(-1)).clamp(0.0, 1.0)
+        # Travel only counts while the foot is actually lifted clear: a foot
+        # dragged or skimmed sideways below min_swing_height earns nothing.
+        heights = env.scene[height_sensor_name].data.heights  # [B, 2]
+        lifted_clear = in_air & (heights >= min_swing_height)
+        progress = progress * lifted_clear.float()
+        previous_peak = torch.where(started, torch.zeros_like(self.peak_progress), self.peak_progress)
+        current_peak = torch.where(
+            in_air, torch.maximum(previous_peak, progress), torch.zeros_like(previous_peak)
+        )
+        rise = current_peak - previous_peak
+        # A repeat by the last landing foot cannot collect another reward.
+        eligible_foot = torch.arange(2, device=contact.device).unsqueeze(0) != self.last_landed_side.unsqueeze(-1)
+        single_swing = in_air.sum(dim=-1) == 1
+        foot_reward = (rise * in_air.float() * eligible_foot.float()).sum(dim=-1)
+        foot_reward = foot_reward * single_swing.float()
+        # A landing that gained ground becomes that foot's new mark.
+        advanced = landed & (foot_travel > 0.0)
+        self.foot_anchor_xy = torch.where(advanced.unsqueeze(-1), foot_pos_xy, self.foot_anchor_xy)
+
+        # Base: ground gained past its furthest previous position.
+        base_travel = ((base_pos_xy - self.base_anchor_xy) * lateral_now).sum(dim=-1) * sign
+        # Paid (and the mark moved) only on steps where one foot is lifted clear
+        # with the other planted; ground the base gains while both feet are
+        # down or a foot is being dragged stays unpaid until a real swing.
+        clear_swing = single_swing & lifted_clear.any(dim=-1)
+        base_gain = base_travel.clamp(min=0.0) * clear_swing.float()
+        self.base_anchor_xy = torch.where((base_gain > 0.0)[:, None], base_pos_xy, self.base_anchor_xy)
+        base_reward = base_scale * base_gain / target
+
+        single_landing = landed.sum(dim=-1) == 1
+        landed_side = landed.long().argmax(dim=-1)
+        self.last_landed_side = torch.where(
+            single_landing, landed_side,
+            torch.where(
+                landed.sum(dim=-1) > 1,
+                torch.full_like(self.last_landed_side, -1),
+                self.last_landed_side,
+            ),
+        )
+        self.peak_progress = current_peak
+        self.was_air = in_air
+        return (foot_reward + base_reward) * active.float()
+
+
 class forward_step_reward:
     """Reward a completed planar step that matches the commanded x/y velocity.
 
@@ -1536,8 +1723,16 @@ def feet_air_time_continuous_reward(
     threshold_max: float = 0.7,
     command_name: str = "twist",
     command_threshold: float = 0.01,
+    ramp_from: float | None = None,
 ) -> torch.Tensor:
-    """Reward each step of single-foot swing within the allowed air-time range."""
+    """Reward each step of single-foot swing within the allowed air-time range.
+
+    Pays 1 per step while the swing foot's air time is in
+    [threshold_min, threshold_max] and 0 past threshold_max. With
+    ``ramp_from`` set, air time below threshold_min is no longer worth 0: it
+    pays a linear ramp from 0 at ``ramp_from`` up to 1 at threshold_min, so a
+    swing that is still too short earns more the longer the foot stays up.
+    """
     sensor: ContactSensor = env.scene[sensor_name]
     current_air_time = sensor.data.current_air_time
     found = sensor.data.found
@@ -1546,17 +1741,24 @@ def feet_air_time_continuous_reward(
         found = found.any(dim=-1)
     in_air = ~found.bool()
     single_swing = in_air.sum(dim=-1) == 1
-    valid_duration = (current_air_time >= threshold_min) & (
-        current_air_time <= threshold_max
-    )
+    if ramp_from is None:
+        duration_score = (
+            (current_air_time >= threshold_min) & (current_air_time <= threshold_max)
+        ).float()
+    else:
+        if ramp_from >= threshold_min:
+            raise ValueError("ramp_from must be below threshold_min")
+        ramp = (current_air_time - ramp_from) / (threshold_min - ramp_from)
+        duration_score = ramp.clamp(0.0, 1.0) * (
+            current_air_time <= threshold_max
+        ).float()
+    swing_score = (duration_score * in_air.float()).amax(dim=-1)
 
     command = env.command_manager.get_command(command_name)
     assert command is not None
     cmd_speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
     active = cmd_speed > command_threshold
-    return (in_air & valid_duration).any(dim=-1).float() * (
-        single_swing & active
-    ).float()
+    return swing_score * (single_swing & active).float()
 
 
 def both_feet_airborne_penalty(
@@ -1878,12 +2080,11 @@ class selected_action_excess_l2:
 
 
 class upper_body_excursion_penalty:
-    """Hard-style cap on how far each upper-body joint may swing off zero.
+    """Hard-style cap on how far each upper-body joint may swing off default.
 
-    All of torso_yaw, the arm joints and neck_yaw/head_pitch sit at 0.0 in
-    HOME_KEYFRAME (only the six leg joints listed there are non-zero), so
-    "off zero" and "off default" are the same thing for every joint this term
-    is meant to cover.
+    Measured from ``default_joint_pos`` (HOME_KEYFRAME), not from zero: the
+    elbows sit folded at +/-130deg there, so an absolute |q| cap would charge
+    the resting pose every step.
 
     These joints have very wide physical ranges -- torso_yaw and shoulder_yaw
     are +/-180deg, elbow_pitch is -143..120deg -- so dof_pos_limits, which only
@@ -1936,7 +2137,10 @@ class upper_body_excursion_penalty:
         del max_excursion  # Resolved once in __init__.
         asset: Entity = env.scene[asset_cfg.name]
         joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
-        excess = torch.clamp(torch.abs(joint_pos) - self.max_excursion, min=0.0)
+        default_joint_pos = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+        excess = torch.clamp(
+            torch.abs(joint_pos - default_joint_pos) - self.max_excursion, min=0.0
+        )
         return torch.sum(excess, dim=-1)
 
 
@@ -2692,10 +2896,13 @@ class airborne_foot_arm_swing_reward:
     """Coordinate shoulder pitch with the single airborne foot during forward motion.
 
     With the left foot airborne, the right arm should point forward and the
-    left arm backward; with the right foot airborne, the targets reverse. The
+    left arm backward; with the right foot airborne, the targets reverse.
     On straight forward commands, both arms must move in their target directions
-    to earn a positive score; a wrong or stationary arm scores negatively. For
-    other commands, penalize the squared raw actions of all ten arm joints.
+    to earn a positive score; a wrong or stationary arm scores negatively, and
+    the squared raw actions of the eight other arm joints (shoulder roll/yaw,
+    elbow, wrist) are still subtracted, so only the shoulder pitch swings and
+    the folded elbow stays at its default. For other commands, penalize the
+    squared raw actions of all ten arm joints.
     """
 
     _JOINTS = ("left_shoulder_pitch", "right_shoulder_pitch")
@@ -2729,6 +2936,12 @@ class airborne_foot_arm_swing_reward:
             raise ValueError(f"Arm joints missing from action targets: {missing}")
         self.arm_action_ids = torch.tensor(
             [action_names.index(name) for name in self._ARM_JOINTS],
+            dtype=torch.long,
+            device=env.device,
+        )
+        # Every arm joint except the two shoulder pitches that do the swinging.
+        self.non_swing_arm_action_ids = torch.tensor(
+            [action_names.index(name) for name in self._ARM_JOINTS if name not in self._JOINTS],
             dtype=torch.long,
             device=env.device,
         )
@@ -2791,9 +3004,12 @@ class airborne_foot_arm_swing_reward:
         )
         raw_action = env.action_manager.get_term(action_name).raw_action
         arm_action_penalty = raw_action[:, self.arm_action_ids].square().sum(dim=-1)
+        non_swing_action_penalty = (
+            raw_action[:, self.non_swing_arm_action_ids].square().sum(dim=-1)
+        )
         return torch.where(
             straight_forward,
-            score * exactly_one_airborne.float(),
+            score * exactly_one_airborne.float() - non_swing_action_penalty,
             -arm_action_penalty,
         )
 
