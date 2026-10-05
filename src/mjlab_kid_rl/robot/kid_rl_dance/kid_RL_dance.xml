@@ -30,7 +30,7 @@
     </default>
     <default class="mx64v2">
       <joint armature="0.011729" damping="1.058645" frictionloss="0.075020" actuatorfrcrange="-3.0 3.0" />
-      <position kp="46" kv="0" forcerange="-3.0 3.0" />
+      <position kp="25" kv="0" forcerange="-3.0 3.0" />
     </default>
     <default class="mx106v2">
       <joint armature="0.026018" damping="2.472776" frictionloss="0.000000" actuatorfrcrange="-6.0 6.0" />
@@ -129,7 +129,7 @@
                 <geom type="mesh" mesh="left_arm3" pos="-0.259242 0.35253 -0.864001" euler="1.5708 0 -3.14159" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
                 <geom group="1" name="left_arm3_collision" type="mesh" mesh="left_arm3" pos="-0.259242 0.35253 -0.864001" euler="1.5708 0 -3.14159" rgba="0.7 0.7 0.7 1" />
                 <inertial pos="-0.00379081 -0.0204452 -0.0778713" mass="0.1302" fullinertia="0.000137342 0.000129022 3.77684e-05 -7.91148e-08 -1.65918e-05 -1.31286e-08" />
-                <joint name="left_elbow_pitch" pos="0 0 0" axis="0 1 0" range="-2.496 2.089" actuatorfrcrange="-1.4 1.4" class="mx28" />
+                <joint name="left_elbow_pitch" pos="0 0 0" axis="0 1 0" range="-2.443461 2.089" actuatorfrcrange="-1.4 1.4" class="mx28" />
                 <body name="left_hand_tip" pos="0 0 -0.0929">
                   <geom type="mesh" mesh="left_hand_tip" pos="-0.267569 0.349304 -0.869733" euler="1.5708 -9.20831e-05 -3.14159" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
                   <geom group="1" name="left_hand_tip_collision" type="mesh" mesh="left_hand_tip" pos="-0.267569 0.349304 -0.869733" euler="1.5708 -9.20831e-05 -3.14159" rgba="0.7 0.7 0.7 1" />
@@ -159,7 +159,7 @@
                 <geom type="mesh" mesh="right_arm3" pos="-0.152514 0.239321 -0.684498" euler="1.5708 0 -3.14159" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
                 <geom group="1" name="right_arm3_collision" type="mesh" mesh="right_arm3" pos="-0.152514 0.239321 -0.684498" euler="1.5708 0 -3.14159" rgba="0.7 0.7 0.7 1" />
                 <inertial pos="-0.00379079 0.0205208 -0.0778712" mass="0.1302" fullinertia="0.000137339 0.000129015 3.77708e-05 1.99952e-07 -1.65902e-05 3.00036e-07" />
-                <joint name="right_elbow_pitch" pos="0 0 0" axis="0 -1 0" range="-2.496 2.089" actuatorfrcrange="-1.4 1.4" class="mx28" />
+                <joint name="right_elbow_pitch" pos="0 0 0" axis="0 -1 0" range="-2.496 2.443461" actuatorfrcrange="-1.4 1.4" class="mx28" />
                 <body name="right_hand_tip" pos="0 0 -0.0929">
                   <geom type="mesh" mesh="right_hand_tip" pos="-0.217737 0.271061 -0.719646" euler="1.5708 0 -3.14159" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
                   <geom group="1" name="right_hand_tip_collision" type="mesh" mesh="right_hand_tip" pos="-0.217737 0.271061 -0.719646" euler="1.5708 0 -3.14159" rgba="0.7 0.7 0.7 1" />
@@ -227,7 +227,14 @@
                   <geom type="mesh" mesh="left_foot_1" pos="0.021390 -0.055118 0.370834" euler="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
                   <inertial pos="0.0129337 0.00684688 -0.0230149" quat="0.139537 0.758026 0.246772 0.587392" mass="0.4017" diaginertia="0.00168157 0.00162103 0.000387011" />
                   <joint name="left_ankle_roll_actual" pos="0 0 0" axis="1 0 0" actuatorfrcrange="-6 6" armature="1e-3" frictionloss="0.005" damping="0.04" />
-                  <geom group="1" name="left_foot_collision_1" size="0.0877 0.049485 0.031995" pos="0.02082 0.01192 -0.0235" type="box" rgba="0.7 0.7 0.7 1" />
+                  <!-- Sole plate, raised 3.5 mm: the real foot stands on four corner studs and the plate only
+                       touches the ground when the foot tilts. Stud boxes below follow the CAD mesh (10 mm square,
+                       tips at z=-0.0555). All match _FOOT_PATTERN (.*_foot_collision_.*). -->
+                  <geom group="1" name="left_foot_collision_1" size="0.0877 0.049485 0.030245" pos="0.02082 0.01192 -0.02175" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="left_foot_collision_stud_1" size="0.005 0.005 0.005" pos="-0.05833 -0.02908 -0.0505" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="left_foot_collision_stud_2" size="0.005 0.005 0.005" pos="-0.05833 0.05292 -0.0505" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="left_foot_collision_stud_3" size="0.005 0.005 0.005" pos="0.07822 -0.02908 -0.0505" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="left_foot_collision_stud_4" size="0.005 0.005 0.005" pos="0.07822 0.05292 -0.0505" type="box" rgba="0 0 0 0" />
                   <geom group="1" name="left_foot_collision_2" size="0.0201 0.02765 0.03255" pos="-0.03228 9e-06 0.00195" quat="9.38184e-07 0.707105 0.707108 9.38187e-07" type="box" rgba="0.7 0.7 0.7 1" />
                   <!-- 5 mm inward-only clearance proxy; bit 32 isolates it from terrain. -->
                   <geom name="left_foot_inner_safety" type="box" size="0.0877 0.0025 0.031995" pos="0.02082 -0.040065 -0.0235" contype="32" conaffinity="32" condim="1" density="0" group="1" rgba="0 0 0 0" />
@@ -307,7 +314,14 @@
                   <geom type="mesh" mesh="right_foot_1" pos="0.023172 0.055275 0.369834" euler="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
                   <inertial pos="0.0129337 -0.00684419 -0.0230154" quat="-0.139535 0.758015 -0.246807 0.587392" mass="0.4017" diaginertia="0.0016816 0.00162103 0.000387017" />
                   <joint name="right_ankle_roll_actual" pos="0 0 0" axis="1 0 0" actuatorfrcrange="-6 6" armature="1e-3" frictionloss="0.005" damping="0.04" />
-                  <geom group="1" name="right_foot_collision_1" size="0.0877 0.049485 0.031995" pos="0.02082 -0.01192 -0.02351" type="box" rgba="0.7 0.7 0.7 1" />
+                  <!-- Sole plate, raised 3.5 mm: the real foot stands on four corner studs and the plate only
+                       touches the ground when the foot tilts. Stud boxes below follow the CAD mesh (10 mm square,
+                       tips at z=-0.0555). All match _FOOT_PATTERN (.*_foot_collision_.*). -->
+                  <geom group="1" name="right_foot_collision_1" size="0.0877 0.049485 0.030245" pos="0.02082 -0.01192 -0.02176" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="right_foot_collision_stud_1" size="0.005 0.005 0.005" pos="-0.05833 -0.05292 -0.0505" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="right_foot_collision_stud_2" size="0.005 0.005 0.005" pos="-0.05833 0.02908 -0.0505" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="right_foot_collision_stud_3" size="0.005 0.005 0.005" pos="0.07822 -0.05292 -0.0505" type="box" rgba="0 0 0 0" />
+                  <geom group="1" name="right_foot_collision_stud_4" size="0.005 0.005 0.005" pos="0.07822 0.02908 -0.0505" type="box" rgba="0 0 0 0" />
                   <geom group="1" name="right_foot_collision_2" size="0.0201 0.02765 0.03255" pos="-0.03228 -9e-06 0.00195" quat="0.707105 0 0 -0.707108" type="box" rgba="0.7 0.7 0.7 1" />
                   <geom name="right_foot_inner_safety" type="box" size="0.0877 0.0025 0.031995" pos="0.02082 0.040065 -0.02351" contype="32" conaffinity="32" condim="1" density="0" group="1" rgba="0 0 0 0" />
                   <site name="right_foot" pos="0.02082 -0.01192 -0.0555" size="0.005" />
@@ -343,12 +357,12 @@
     <position name="left_shoulder_pitch" joint="left_shoulder_pitch" class="mx28" ctrlrange="-3.14159 3.14159" />
     <position name="left_shoulder_roll" joint="left_shoulder_roll" class="mx28" ctrlrange="-1.138 1.5" />
     <position name="left_shoulder_yaw" joint="left_shoulder_yaw" class="mx28" ctrlrange="-3.14159 3.14159" />
-    <position name="left_elbow_pitch" joint="left_elbow_pitch" class="mx28" ctrlrange="-2.496 2.089" />
+    <position name="left_elbow_pitch" joint="left_elbow_pitch" class="mx28" ctrlrange="-2.443461 2.089" />
     <position name="left_wrist_pitch" joint="left_wrist_pitch" class="mx28" ctrlrange="-1.34 0.119" />
     <position name="right_shoulder_pitch" joint="right_shoulder_pitch" class="mx28" ctrlrange="-3.14159 3.14159" />
     <position name="right_shoulder_roll" joint="right_shoulder_roll" class="mx28" ctrlrange="-1.5 1.138" />
     <position name="right_shoulder_yaw" joint="right_shoulder_yaw" class="mx28" ctrlrange="-3.14159 3.14159" />
-    <position name="right_elbow_pitch" joint="right_elbow_pitch" class="mx28" ctrlrange="-2.496 2.089" />
+    <position name="right_elbow_pitch" joint="right_elbow_pitch" class="mx28" ctrlrange="-2.496 2.443461" />
     <position name="right_wrist_pitch" joint="right_wrist_pitch" class="mx28" ctrlrange="-1.34 0.119" />
     <position name="left_hip_yaw" joint="left_hip_yaw" class="mx64v2" ctrlrange="-3.142 3.142" />
     <position name="left_hip_roll" joint="left_hip_roll_crank" class="mx106v2" ctrlrange="-1.186824 1.186824" />
@@ -372,6 +386,16 @@
     <exclude body1="right_hip_crank_1" body2="right_hip_slider_1" />
     <exclude body1="left_ankle_1" body2="left_ankle_crank_1" />
     <exclude body1="right_ankle_1" body2="right_ankle_crank_1" />
+    <!-- Ankle roll crank (carried by the foot) vs the shin: their box proxies
+         start to overlap by 1-2 mm at ~30deg of ankle pitch off the stance pose
+         with ~15deg of crank, well inside both joint ranges. -->
+    <exclude body1="left_lower_leg_1" body2="left_ankle_crank_1" />
+    <exclude body1="right_lower_leg_1" body2="right_ankle_crank_1" />
+    <!-- Elbow pinch: the convex hulls of the upper arm (arm1) and forearm (arm3)
+         meshes overlap from ~120deg of forward fold, although the real robot
+         folds to 130deg+ without contact. -->
+    <exclude body1="left_arm1" body2="left_arm3" />
+    <exclude body1="right_arm1" body2="right_arm3" />
   </contact>
   <tendon>
     <fixed name="left_hip_cap_couple">
