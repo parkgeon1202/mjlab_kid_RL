@@ -52,7 +52,7 @@ from mjlab_kid_rl.tasks.mdp import (
   base_height_penalty,
   feet_crossing_reward,
   foot_flatness_penalty,
-  foot_non_stud_contact_penalty,
+  # foot_non_stud_contact_penalty,
   foot_landing_alignment_reward,
   flatness_weighted_foot_slip_penalty,
   feet_air_time_continuous_reward,
@@ -229,18 +229,20 @@ NON_FOOT_TERRAIN_CONTACT_SENSOR_CFG = ContactSensorCfg(
 # Foot geoms that are not studs -- the raised sole plate (collision_1) and the
 # ankle block (collision_2) -- against the terrain. The foot should stand on its
 # four studs; these only touch when it tips onto the toe edge or rolls over.
-FOOT_NON_STUD_CONTACT_SENSOR_CFG = ContactSensorCfg(
-  name="foot_non_stud_contact",
-  primary=ContactMatch(
-    mode="geom",
-    pattern=r"^(left|right)_foot_collision_[12]$",
-    entity="robot",
-  ),
-  secondary=ContactMatch(mode="body", pattern="terrain"),
-  fields=("found",),
-  reduce="none",
-  num_slots=1,
-)
+# Disabled 2026-10-06: the sole plate no longer collides with the ground, so
+# this has nothing left to detect but the ankle block.
+# FOOT_NON_STUD_CONTACT_SENSOR_CFG = ContactSensorCfg(
+#   name="foot_non_stud_contact",
+#   primary=ContactMatch(
+#     mode="geom",
+#     pattern=r"^(left|right)_foot_collision_[12]$",
+#     entity="robot",
+#   ),
+#   secondary=ContactMatch(mode="body", pattern="terrain"),
+#   fields=("found",),
+#   reduce="none",
+#   num_slots=1,
+# )
 
 # One frame per foot (site placed at the sole's bottom face, see kid_RL_dance.xml).
 # include_geom_groups=(0,) means "terrain only": the 52 foot/self-collision boxes
@@ -618,7 +620,7 @@ def make_kid_rl_velocity_env_cfg(
     SELF_COLLISION_SENSOR_CFG,
     *LINKAGE_CONTACT_SENSOR_CFGS,
     NON_FOOT_TERRAIN_CONTACT_SENSOR_CFG,
-    FOOT_NON_STUD_CONTACT_SENSOR_CFG,
+    # FOOT_NON_STUD_CONTACT_SENSOR_CFG,
   )
 
   # ---------------------------- Terminations ----------------------
@@ -1334,11 +1336,12 @@ def make_kid_rl_velocity_env_cfg(
   # policy to actually lift its feet.
   # Charge every step for each non-stud foot geom on the ground (the sole
   # plate's toe edge, the ankle block): walk on the studs, not on the toe.
-  cfg.rewards["foot_non_stud_contact"] = RewardTermCfg(
-    func=foot_non_stud_contact_penalty,
-    weight=0.0,
-    params={"sensor_name": FOOT_NON_STUD_CONTACT_SENSOR_CFG.name},
-  )
+  # Disabled 2026-10-06 together with its sensor (see FOOT_NON_STUD_CONTACT_SENSOR_CFG).
+  # cfg.rewards["foot_non_stud_contact"] = RewardTermCfg(
+  #   func=foot_non_stud_contact_penalty,
+  #   weight=0.0,
+  #   params={"sensor_name": FOOT_NON_STUD_CONTACT_SENSOR_CFG.name},
+  # )
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
     weight=-3.0,
@@ -1567,7 +1570,7 @@ def make_kid_rl_velocity_env_cfg(
   # was a plausible contributor to fell_over alongside the other issues found
   # this session (double curriculum, action-std runaway). 0.6 still gives real
   # low-friction variety without handing every env a near-ice floor.
-  cfg.events["foot_friction"].params["ranges"] = (0.4, 1.2)
+  cfg.events["foot_friction"].params["ranges"] = (0.8, 1.2)
   for side in ("left", "right"):
     for joint in ("hip", "ankle"):
       linkage = f"{side}_{joint}"
@@ -1584,7 +1587,7 @@ def make_kid_rl_velocity_env_cfg(
             ),
           ),
           "operation": "scale",
-          "ranges": (0.1, 1.3),
+          "ranges": (0.7, 1.3),
         },
       )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
@@ -1674,8 +1677,8 @@ def make_kid_rl_velocity_env_cfg(
   # *_cap and four *_actual passive joints can each use their own scale range.
   # All eight have armature=1e-3 in the current robot XML.
   _actuated_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
-  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.5, 1.3)
-  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.5, 1.3)
+  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
+  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
   cfg.events["dof_armature_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_armature,
@@ -1706,8 +1709,8 @@ def make_kid_rl_velocity_env_cfg(
 
   # BAM owns the 25 driven joints' friction. The passive cap/actual joints
   # are not BAM targets, so randomize their XML-authored frictionloss directly.
-  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.3, 1.2)
-  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.3, 1.2)
+  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
   cfg.events["dof_cap_friction_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_friction,
