@@ -127,7 +127,10 @@ MX64V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
   target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
-  kp_fw=46,
+  # 46 -> 25 (2026-10-05): fitted to an airborne real log (air1005.csv, firmware kp 46).
+  # Replaying the real targets open-loop, the hip yaws tracked 1.59x too far at 46;
+  # position RMS error is lowest at 0.55x. The real firmware gain stays 46.
+  kp_fw=25,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
