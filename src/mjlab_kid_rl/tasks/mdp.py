@@ -251,6 +251,176 @@ class UniformVelocityCommandWithRotationCfg(UniformVelocityCommandCfg):
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
+def balance_assist_torque_w(
+    projected_gravity_b: torch.Tensor,
+    ang_vel_b: torch.Tensor,
+    quat_w: torch.Tensor,
+    stiffness: float,
+    damping: float,
+) -> torch.Tensor:
+    """World-frame torque that pushes a tilted base back upright.
+
+    Roll (about body x) and pitch (about body y) are read from the gravity
+    direction in the base frame; each gets a spring-damper torque
+    ``-stiffness * angle - damping * rate``. Yaw is left alone.
+    """
+    roll = torch.atan2(-projected_gravity_b[:, 1], -projected_gravity_b[:, 2])
+    pitch = torch.atan2(projected_gravity_b[:, 0], -projected_gravity_b[:, 2])
+    torque_b = torch.zeros_like(ang_vel_b)
+    torque_b[:, 0] = -stiffness * roll - damping * ang_vel_b[:, 0]
+    torque_b[:, 1] = -stiffness * pitch - damping * ang_vel_b[:, 1]
+    return quat_apply(quat_w, torque_b)
+
+
+def distribute_torque_rigidly(
+    torque_w: torch.Tensor,
+    body_pos_w: torch.Tensor,
+    body_mass: torch.Tensor,
+    body_inertia: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Spread one net torque over every body as if the robot were a single rigid body.
+
+    Applying a torque sized for the whole robot to one light link drives that
+    link far harder than its own inertia can take. Instead, find the angular
+    acceleration ``alpha`` the torque would give the robot as one rigid body
+    about its centre of mass, and give each body the wrench that produces that
+    same acceleration: force ``m_i * alpha x r_i`` and torque ``I_i * alpha``.
+    The wrenches sum to exactly ``torque_w`` with zero net force.
+
+    Args:
+        torque_w: [B, 3] net world-frame torque.
+        body_pos_w: [B, nb, 3] body centre-of-mass positions.
+        body_mass: [nb] body masses.
+        body_inertia: [nb] scalar (isotropic) body inertias.
+
+    Returns:
+        (forces [B, nb, 3], torques [B, nb, 3]) in the world frame.
+    """
+    mass = body_mass[None, :, None]
+    com = (mass * body_pos_w).sum(dim=1, keepdim=True) / body_mass.sum()
+    r = body_pos_w - com  # [B, nb, 3]
+    r_sq = (r * r).sum(dim=-1)  # [B, nb]
+    eye = torch.eye(3, device=r.device, dtype=r.dtype)
+    inertia = (
+        (body_inertia[None, :] + body_mass[None, :] * r_sq)[..., None, None] * eye
+        - mass[..., None] * r[..., :, None] * r[..., None, :]
+    ).sum(dim=1)  # [B, 3, 3]
+    alpha = torch.linalg.solve(inertia, torque_w.unsqueeze(-1)).squeeze(-1)  # [B, 3]
+    alpha_b = alpha[:, None, :].expand_as(r)
+    forces = mass * torch.cross(alpha_b, r, dim=-1)
+    torques = body_inertia[None, :, None] * alpha_b
+    return forces, torques
+
+
+class balance_assist:
+    """Hold the trunk up with an external spring-damper torque -- a training aid.
+
+    Every *physics* step it computes ``scale`` times the torque from
+    ``balance_assist_torque_w`` (from the base's roll/pitch and their rates)
+    and spreads it over all of the robot's bodies with
+    ``distribute_torque_rigidly``, so a policy can try lifting a foot without
+    the attempt ending in a fall.
+
+    Both details matter for stability. The gains are sized for the whole robot
+    tipping about its feet; put on the 0.56 kg base link alone, or refreshed
+    only once per 20 ms control step, the damper exceeds the explicit
+    integration limit by orders of magnitude and the simulation diverges.
+
+    It is a switch the user flips, not a curriculum:
+
+    - ``scale`` in the config sets the strength (0 = off, 1 = full).
+    - If ``scale_file`` is given and exists, the number in it overrides
+      ``scale`` and is re-read every ``reload_every`` control steps, so the
+      assist can be turned down or off while training is running.
+
+    Registered as a ``mode="step"`` event (which handles the scale); the
+    wrench itself is applied from a wrapper around ``env.sim.step``.
+
+    A policy trained with the assist on must keep training with it at 0 before
+    it is used anywhere the assist does not exist.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self._asset: Entity = env.scene[asset_cfg.name]
+        params = cfg.params
+        self._stiffness = float(params.get("stiffness", 83.5))
+        self._damping = float(params.get("damping", 16.9))
+        self._max_torque = float(params.get("max_torque", 40.0))
+        self._scale = float(params.get("scale", 0.0))
+        self._steps = 0
+        self._was_active = False
+
+        mj_model = env.sim.mj_model
+        body_ids = self._asset.indexing.body_ids.cpu().numpy()
+        self._body_mass = torch.tensor(
+            mj_model.body_mass[body_ids], device=env.device, dtype=torch.float32
+        )
+        self._body_inertia = torch.tensor(
+            mj_model.body_inertia[body_ids].mean(axis=-1), device=env.device, dtype=torch.float32
+        )
+
+        # Apply at the physics rate: the env calls sim.step() once per substep
+        # and refreshes the entity data right after each one.
+        sim_step = env.sim.step
+
+        def step_with_assist(*args, **kwargs):
+            self._apply()
+            return sim_step(*args, **kwargs)
+
+        env.sim.step = step_with_assist
+
+    def _apply(self) -> None:
+        active = self._scale > 0.0
+        if not active and not self._was_active:
+            return
+        data = self._asset.data
+        torque_w = self._scale * balance_assist_torque_w(
+            data.projected_gravity_b, data.root_link_ang_vel_b, data.root_link_quat_w,
+            self._stiffness, self._damping,
+        )
+        torque_w = torque_w.clamp(-self._max_torque, self._max_torque)
+        # When just switched off this writes zeros once, clearing the last wrench.
+        forces, torques = distribute_torque_rigidly(
+            torque_w, data.body_com_pos_w, self._body_mass, self._body_inertia
+        )
+        self._asset.write_external_wrench_to_sim(forces, torques)
+        self._was_active = active
+
+    def _read_scale(self, default: float, scale_file: str | None) -> float:
+        if scale_file is None:
+            return default
+        try:
+            with open(scale_file) as f:
+                return max(0.0, float(f.read().strip()))
+        except (OSError, ValueError):
+            return default
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+        scale: float = 0.0,
+        stiffness: float = 83.5,
+        damping: float = 16.9,
+        max_torque: float = 40.0,
+        scale_file: str | None = None,
+        reload_every: int = 200,
+    ) -> None:
+        del env, env_ids, asset_cfg
+        self._stiffness, self._damping, self._max_torque = stiffness, damping, max_torque
+        if self._steps % max(reload_every, 1) == 0:
+            new_scale = self._read_scale(scale, scale_file)
+            if new_scale != self._scale or self._steps == 0:
+                print(f"[balance_assist] scale = {new_scale:.3f}")
+            self._scale = new_scale
+        self._steps += 1
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        del env_ids  # Stateless per env.
+
+
 def set_soft_joint_pos_limit_margin(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
@@ -632,7 +802,7 @@ class _LandingTrackingReward:
             0.5 * newly_cleared.any(dim=-1).float()
             + 0.5 * valid_landing.any(dim=-1).float()
         )
-        return torch.where(standing, torch.ones_like(progress_reward), progress_reward)
+        return torch.where(standing, torch.zeros_like(progress_reward), progress_reward)
 
 
 class track_linear_velocity_gated(_LandingTrackingReward):
@@ -1761,6 +1931,80 @@ def feet_air_time_continuous_reward(
     return swing_score * (single_swing & active).float()
 
 
+def feet_single_contact_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    command_threshold: float = 0.1,
+    window_s: float = 0.2,
+    max_air_time: float | None = None,
+) -> torch.Tensor:
+    """Reward recent single-foot contact while allowing natural double-support overlap.
+
+    Port of ROBOTIS cyclo_lab's ``feet_single_contact`` (K1 velocity task). Pays
+    1 on every step that is single stance, or double stance within ``window_s``
+    of the latest touchdown, or flight shorter than ``window_s``. Standing on
+    both feet for longer than ``window_s`` pays 0, so under a moving command the
+    only way to keep collecting it is to keep stepping. It needs no memory of
+    which foot stepped last. A stand command (planar speed plus
+    |yaw rate| at or below ``command_threshold``) pays 0: the original returns 1
+    there, which at a large weight pays standing still more than walking.
+
+    ``max_air_time`` is an addition to the original: single stance stops paying
+    once the swing foot has been up longer than this, so balancing on one leg
+    cannot hold the reward.
+    """
+    sensor: ContactSensor = env.scene[sensor_name]
+    contact_time = sensor.data.current_contact_time
+    air_time = sensor.data.current_air_time
+    assert contact_time is not None and air_time is not None, (
+        f"Sensor '{sensor_name}' needs track_air_time=True"
+    )
+    num_contacts = torch.sum(contact_time > 0.0, dim=1)
+    is_single_stance = num_contacts == 1
+    if max_air_time is not None:
+        is_single_stance = is_single_stance & (air_time.max(dim=1).values <= max_air_time)
+    is_recent_double_stance = (num_contacts == 2) & (contact_time.min(dim=1).values < window_s)
+    is_recent_flight = (num_contacts == 0) & (air_time.min(dim=1).values < window_s)
+    walking_reward = (is_single_stance | is_recent_double_stance | is_recent_flight).float()
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    # Same stand test as the rest of this task: planar speed + |yaw rate|.
+    speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    is_standing = speed <= command_threshold
+    return torch.where(is_standing, torch.zeros_like(walking_reward), walking_reward)
+
+
+def feet_air_time_touchdown_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    command_threshold: float = 0.1,
+    target_air_time: float = 0.4,
+) -> torch.Tensor:
+    """Sparse touchdown air-time reward for regulating stepping frequency.
+
+    Port of ROBOTIS cyclo_lab's ``feet_airtime_touchdown``. On the step a foot
+    lands it pays ``last_air_time - target_air_time`` for that foot: negative for
+    a swing shorter than the target (a shuffle), positive for a longer one. A
+    stand command (planar speed plus |yaw rate| at or below
+    ``command_threshold``) pays 0 (the original returns 1 there).
+    """
+    sensor: ContactSensor = env.scene[sensor_name]
+    last_air_time = sensor.data.last_air_time
+    assert last_air_time is not None, f"Sensor '{sensor_name}' needs track_air_time=True"
+    first_contact = sensor.compute_first_contact(dt=env.step_dt)
+    walking_reward = ((last_air_time - target_air_time) * first_contact.float()).sum(dim=1)
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    # Same stand test as the rest of this task: planar speed + |yaw rate|.
+    speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    is_standing = speed <= command_threshold
+    return torch.where(is_standing, torch.zeros_like(walking_reward), walking_reward)
+
+
 def both_feet_airborne_penalty(
     env: ManagerBasedRlEnv,
     sensor_name: str,
@@ -1925,6 +2169,8 @@ class swing_progress_reward:
     Holding a foot at a fixed height pays nothing after the initial rise.
     Landing rewards only an alternating left/right pair; both feet must have
     cleared min_height, and the lower peak limits the pair's score.
+    With ``max_tilt`` set, nothing is paid on a step where the base's roll or
+    pitch exceeds it.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
@@ -1965,6 +2211,8 @@ class swing_progress_reward:
         command_threshold: float = 0.01,
         height_std: float = 0.01,
         pair_bonus_scale: float = 5.0,
+        max_tilt: float | None = None,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     ) -> torch.Tensor:
         if target_height <= min_height:
             raise ValueError("target_height must be greater than min_height")
@@ -1972,6 +2220,8 @@ class swing_progress_reward:
             raise ValueError("height_std must be positive")
         if pair_bonus_scale < 0.0:
             raise ValueError("pair_bonus_scale must be nonnegative")
+        if max_tilt is not None and max_tilt <= 0.0:
+            raise ValueError("max_tilt must be positive")
 
         sensor: ContactSensor = env.scene[sensor_name]
         found = sensor.data.found
@@ -2028,7 +2278,18 @@ class swing_progress_reward:
         command = env.command_manager.get_command(command_name)
         assert command is not None
         speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
-        return (lift_reward + pair_reward) * (speed > command_threshold).float()
+        reward = (lift_reward + pair_reward) * (speed > command_threshold).float()
+        if max_tilt is not None:
+            # A foot that leaves the ground because the trunk is toppling is not
+            # a step: pay nothing while base roll or pitch exceeds max_tilt.
+            # The step bookkeeping above still runs so it stays in sync.
+            asset: Entity = env.scene[asset_cfg.name]
+            gravity_b = asset.data.projected_gravity_b
+            roll = torch.atan2(gravity_b[:, 1], -gravity_b[:, 2])
+            pitch = torch.atan2(-gravity_b[:, 0], -gravity_b[:, 2])
+            upright = (roll.abs() <= max_tilt) & (pitch.abs() <= max_tilt)
+            reward = reward * upright.float()
+        return reward
 
 def base_height_penalty(
     env: ManagerBasedRlEnv,
@@ -2215,6 +2476,27 @@ class foot_landing_alignment_reward:
         ).sum(dim=-1) * valid_landing.float()
         self.hop_in_progress &= ~both_planted
         return reward
+
+
+def foot_non_stud_contact_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+) -> torch.Tensor:
+    """Count foot geoms other than the studs that are touching the ground.
+
+    The foot is meant to stand on its four corner studs. The sole plate sits
+    3.5 mm above them and overhangs the toe, so it only reaches the ground when
+    the foot tips onto its front edge; the ankle block only when the foot rolls
+    right over. ``sensor_name`` must be a contact sensor whose primary matches
+    exactly those non-stud foot geoms. Returns the number in contact per env
+    (use with a negative weight); charged whatever the command.
+    """
+    sensor: ContactSensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+    if found.dim() == 3:
+        found = found.any(dim=-1)
+    return (found > 0).float().sum(dim=-1)
 
 
 def foot_flatness_penalty(

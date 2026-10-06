@@ -46,14 +46,18 @@ from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotationCfg,
   default_joint_pose_exp,
   set_soft_joint_pos_limit_margin,
+  balance_assist,
   airborne_foot_arm_swing_reward,
   feet_distance_penalty,
   base_height_penalty,
   feet_crossing_reward,
   foot_flatness_penalty,
+  foot_non_stud_contact_penalty,
   foot_landing_alignment_reward,
   flatness_weighted_foot_slip_penalty,
   feet_air_time_continuous_reward,
+  feet_air_time_touchdown_reward,
+  feet_single_contact_reward,
   both_feet_airborne_penalty,
   forward_step_reward,
   lateral_swing_progress_reward,
@@ -215,6 +219,22 @@ NON_FOOT_TERRAIN_CONTACT_SENSOR_CFG = ContactSensorCfg(
     pattern=r".*",
     entity="robot",
     exclude=(r"^(left|right)_foot_1$",),
+  ),
+  secondary=ContactMatch(mode="body", pattern="terrain"),
+  fields=("found",),
+  reduce="none",
+  num_slots=1,
+)
+
+# Foot geoms that are not studs -- the raised sole plate (collision_1) and the
+# ankle block (collision_2) -- against the terrain. The foot should stand on its
+# four studs; these only touch when it tips onto the toe edge or rolls over.
+FOOT_NON_STUD_CONTACT_SENSOR_CFG = ContactSensorCfg(
+  name="foot_non_stud_contact",
+  primary=ContactMatch(
+    mode="geom",
+    pattern=r"^(left|right)_foot_collision_[12]$",
+    entity="robot",
   ),
   secondary=ContactMatch(mode="body", pattern="terrain"),
   fields=("found",),
@@ -442,6 +462,14 @@ LEG_DOFS_FILTER = r"^(left|right)_(hip_yaw|hip_roll_crank|hip_pitch|knee_pitch|a
 UPPER_BODY_DOFS_FILTER = r"^(torso_yaw|neck_yaw|head_pitch|(left|right)_(shoulder_pitch|shoulder_roll|shoulder_yaw|elbow_pitch|wrist_pitch))$"
 """The 13 actuated upper-body joints: torso, neck/head and both arms."""
 
+BALANCE_ASSIST_SCALE: float | None = 0.0
+"""Strength of the balance-assist torque during training: 0 = off, 1 = full.
+None removes the event entirely (then the scale file is ignored too)."""
+
+BALANCE_ASSIST_SCALE_FILE = "balance_assist_scale.txt"
+"""If this file exists (path relative to where training is launched), the number
+in it overrides BALANCE_ASSIST_SCALE and is re-read while training runs."""
+
 USE_GAIT_PHASE = False
 """보행 위상(gait_phase) 관측과 위상 보상(gait_phase_contact, gait_phase_swing_clearance) 사용 여부.
 2026-09-30 재학습부터 끈다. 실기 컨트롤러는 모델 메타데이터로 84/86 차원을 자동 판별한다."""
@@ -590,6 +618,7 @@ def make_kid_rl_velocity_env_cfg(
     SELF_COLLISION_SENSOR_CFG,
     *LINKAGE_CONTACT_SENSOR_CFGS,
     NON_FOOT_TERRAIN_CONTACT_SENSOR_CFG,
+    FOOT_NON_STUD_CONTACT_SENSOR_CFG,
   )
 
   # ---------------------------- Terminations ----------------------
@@ -887,7 +916,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["pose"].params["std_running"] = std_running
   cfg.rewards["pose"].params["walking_threshold"] = walking_threshold
   cfg.rewards["pose"].params["running_threshold"] = running_threshold
-  cfg.rewards["pose"].weight = 0.1
+  cfg.rewards["pose"].weight = 0.5
 
   # Reward proximity to HOME_KEYFRAME during stand commands.
   # The target comes from robot.data.default_joint_pos; walking is unaffected.
@@ -912,11 +941,13 @@ def make_kid_rl_velocity_env_cfg(
   # almost nothing (Episode_Reward/upright ~0.03) next to termination (~-0.99)
   # and self_collisions (~-0.62) -- doubling it to push staying-upright harder
   # before the policy ever gets punished for falling.
-  cfg.rewards["upright"].weight = 0.5
+  cfg.rewards["upright"].weight = 1.0
 
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("base_link",)
-  cfg.rewards["body_ang_vel"].weight = -0.05
-  cfg.rewards["angular_momentum"].weight = -0.02
+  # Same quantity as cyclo_lab's ang_vel_xy_l2 (base roll/pitch rate squared),
+  # at that task's weight.
+  cfg.rewards["body_ang_vel"].weight = -0.4
+  cfg.rewards["angular_momentum"].weight = -0.1
 
   cfg.rewards["foot_clearance"].params["asset_cfg"].site_names = tuple(foot_site_names)
 
@@ -947,9 +978,38 @@ def make_kid_rl_velocity_env_cfg(
   # a short swing still earns more the longer the foot stays up.
   # Landing and overlong swings receive no air-time reward.
   cfg.rewards["air_time"].weight = 1.5
+  # Two stepping terms from ROBOTIS cyclo_lab's K1 velocity task (which walks
+  # without a gait clock), with that task's weights. The stand test is this
+  # task's own (planar speed + |yaw rate| <= walking_threshold).
+  #
+  # feet_single_contact: 1 on every step that is single stance or within 0.2 s
+  # of a touchdown. Standing on both feet longer than that pays 0, so only
+  # continued stepping keeps it. It needs no memory of which foot stepped last.
+  cfg.rewards["feet_single_contact"] = RewardTermCfg(
+    func=feet_single_contact_reward,
+    weight=1.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "window_s": 0.2,
+    },
+  )
+  # feet_air_time_touchdown: at each landing pays (air time - max_swing_time),
+  # so the shorter the swing, the more the landing costs.
+  cfg.rewards["feet_air_time_touchdown"] = RewardTermCfg(
+    func=feet_air_time_touchdown_reward,
+    weight=0.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "command_name": "twist",
+      "command_threshold": walking_threshold,
+      "target_air_time": max_swing_time,
+    },
+  )
   cfg.rewards["both_feet_airborne"] = RewardTermCfg(
     func=both_feet_airborne_penalty,
-    weight=-3.0,
+    weight=-0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "min_air_time_s": 0.06,
@@ -970,7 +1030,7 @@ def make_kid_rl_velocity_env_cfg(
   # Penalize missing foot contact or base motion during a stand command.
   cfg.rewards["settled_standing"] = RewardTermCfg(
     func=settled_standing_penalty,
-    weight=-1.0,
+    weight=-5.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -984,7 +1044,7 @@ def make_kid_rl_velocity_env_cfg(
     func=not_stepping_penalty,
     # Charge only after one uninterrupted second of double support under
     # a walking command. Landing between steps resets the timer.
-    weight=-1.0,
+    weight=-0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -997,7 +1057,7 @@ def make_kid_rl_velocity_env_cfg(
   # weight=-500 gives an actual one-step cost of -10 per overdue foot.
   cfg.rewards["not_stepping_each_foot"] = RewardTermCfg(
     func=not_stepping_each_foot_penalty,
-    weight=-10.0,
+    weight=-0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1055,7 +1115,7 @@ def make_kid_rl_velocity_env_cfg(
   # while still allowing the policy to attempt recovery.
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
-    weight=-20.0,
+    weight=-200.0,
     params={"minimum_height": 0.35},
   )
 
@@ -1083,15 +1143,20 @@ def make_kid_rl_velocity_env_cfg(
     func=upper_body_excursion_penalty,
     weight=-1.0,
     params={
+      # Tight on purpose: the upper body should barely move off HOME. 0.05 rad
+      # is ~3 deg. Three joints sag under gravity with zero action (measured:
+      # elbow 0.09-0.10 rad folded at 130 deg, head_pitch 0.07, shoulder_pitch
+      # 0.05), so their caps sit just above that -- a tighter one would charge
+      # the resting pose on every step.
       "max_excursion": {
-        r".*torso_yaw.*": 0.3,
-        r".*shoulder_pitch.*": 0.6,
-        r".*shoulder_roll.*": 0.2,
-        r".*shoulder_yaw.*": 0.2,
-        r".*elbow.*": 0.3,
-        r".*wrist_pitch.*": 0.2,
-        r"neck_yaw": 0.15,
-        r"head_pitch": 0.15,
+        r".*torso_yaw.*": 0.05,
+        r".*shoulder_pitch.*": 0.1,
+        r".*shoulder_roll.*": 0.05,
+        r".*shoulder_yaw.*": 0.05,
+        r".*elbow.*": 0.15,
+        r".*wrist_pitch.*": 0.05,
+        r"neck_yaw": 0.05,
+        r"head_pitch": 0.1,
       },
       "asset_cfg": SceneEntityCfg(
         "robot",
@@ -1138,7 +1203,7 @@ def make_kid_rl_velocity_env_cfg(
   # largest positive term (track_linear_velocity, weight 2.0) contributes 0.04.
   cfg.rewards["termination"] = RewardTermCfg(
     func=envs_mdp.is_terminated,
-    weight=-200.0,
+    weight=-400.0,
     params={},
   )
   # air_time pays each foot out independently, so hopping twice on one leg
@@ -1204,12 +1269,15 @@ def make_kid_rl_velocity_env_cfg(
       "command_threshold": walking_threshold,
       "height_std": 0.01,
       "pair_bonus_scale": 5.0,
+      # No reward while the base is tilted more than 30deg in roll or pitch:
+      # a foot lifted by a toppling trunk is not a step.
+      "max_tilt": float(np.deg2rad(30.0)),
     },
   )
 
   cfg.rewards["same_foot_repeat"] = RewardTermCfg(
     func=same_foot_repeat_penalty,
-    weight=-10.0,
+    weight=-30.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1231,7 +1299,7 @@ def make_kid_rl_velocity_env_cfg(
   # Episode_Reward/gait_symmetry is nonzero and episodes last a few cycles.
   cfg.rewards["gait_symmetry"] = RewardTermCfg(
     func=gait_symmetry_reward,
-    weight=5.0,
+    weight=10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "asset_cfg": SceneEntityCfg("robot", site_names=tuple(foot_site_names)),
@@ -1264,6 +1332,13 @@ def make_kid_rl_velocity_env_cfg(
   # during toe-off/mid-air/heel-strike, and charging it for that fights every
   # other stepping-related reward in this file that's trying to get the
   # policy to actually lift its feet.
+  # Charge every step for each non-stud foot geom on the ground (the sole
+  # plate's toe edge, the ankle block): walk on the studs, not on the toe.
+  cfg.rewards["foot_non_stud_contact"] = RewardTermCfg(
+    func=foot_non_stud_contact_penalty,
+    weight=0.0,
+    params={"sensor_name": FOOT_NON_STUD_CONTACT_SENSOR_CFG.name},
+  )
   cfg.rewards["foot_flatness"] = RewardTermCfg(
     func=foot_flatness_penalty,
     weight=-3.0,
@@ -1276,7 +1351,7 @@ def make_kid_rl_velocity_env_cfg(
   # Reward sole alignment with the actual terrain normal only on landing.
   cfg.rewards["foot_landing_alignment"] = RewardTermCfg(
     func=foot_landing_alignment_reward,
-    weight=1.5,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1289,7 +1364,7 @@ def make_kid_rl_velocity_env_cfg(
   # Keep the one-off bonus when the next qualifying foot is the opposite one.
   cfg.rewards["feet_crossing"] = RewardTermCfg(
     func=feet_crossing_reward,
-    weight=4.0,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1306,7 +1381,7 @@ def make_kid_rl_velocity_env_cfg(
   # and diagonal steps; see forward_step_reward for the frame conversion.
   cfg.rewards["forward_step"] = RewardTermCfg(
     func=forward_step_reward,
-    weight=50.0,
+    weight=0.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1335,7 +1410,7 @@ def make_kid_rl_velocity_env_cfg(
   # is switched off (base_scale 0); base motion is left to velocity tracking.
   cfg.rewards["lateral_swing_progress"] = RewardTermCfg(
     func=lateral_swing_progress_reward,
-    weight=40.0,
+    weight=30.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1352,7 +1427,7 @@ def make_kid_rl_velocity_env_cfg(
 
   cfg.rewards["velocity_shortfall"] = RewardTermCfg(
     func=velocity_shortfall_penalty,
-    weight=-0.6,
+    weight=-0.0,
     params={"command_name": "twist"},
   )
   cfg.rewards["relative_linear_velocity_error"] = RewardTermCfg(
@@ -1389,7 +1464,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.2,
+    weight=-0.0,
     params={},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
@@ -1422,7 +1497,7 @@ def make_kid_rl_velocity_env_cfg(
   # Match the 20 s episode horizon: reset samples one fresh command and the
   # timeout resets the environment before an in-episode resample can occur.
   # Both bounds are required; ``(20.0)`` would be a float, not a one-item tuple.
-  command.resampling_time_range = (10.0, 20.0)
+  command.resampling_time_range = (20.0, 20.0)
   command.rel_standing_envs = 0.1
   command.rel_heading_envs = 0.0
   command.rel_rotation_envs = 0.1
@@ -1458,8 +1533,8 @@ def make_kid_rl_velocity_env_cfg(
   # of resets.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.15, 0.15),
-      "velocity_range": (-0.3, 0.3),
+      "position_range": (-0.0, 0.0),
+      "velocity_range": (-0.0, 0.0),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(LEG_DOFS_FILTER,)),
     }
   )
@@ -1483,7 +1558,7 @@ def make_kid_rl_velocity_env_cfg(
     "roll": (0.0, 0.0),
     "pitch": (0.0, 0.0),
   }
-  cfg.events["push_robot"].interval_range_s = (5.0, 20.0)
+  cfg.events["push_robot"].interval_range_s = (15.0, 20.0)
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
     r".*left_foot_collision.*",
     r".*right_foot_collision.*",
@@ -1492,7 +1567,7 @@ def make_kid_rl_velocity_env_cfg(
   # was a plausible contributor to fell_over alongside the other issues found
   # this session (double curriculum, action-std runaway). 0.6 still gives real
   # low-friction variety without handing every env a near-ice floor.
-  cfg.events["foot_friction"].params["ranges"] = (0.8, 1.2)
+  cfg.events["foot_friction"].params["ranges"] = (0.4, 1.2)
   for side in ("left", "right"):
     for joint in ("hip", "ankle"):
       linkage = f"{side}_{joint}"
@@ -1509,7 +1584,7 @@ def make_kid_rl_velocity_env_cfg(
             ),
           ),
           "operation": "scale",
-          "ranges": (0.7, 1.3),
+          "ranges": (0.1, 1.3),
         },
       )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
@@ -1536,6 +1611,39 @@ def make_kid_rl_velocity_env_cfg(
   # Soft joint limits = hard limits minus min(7deg, 5% of range) per side,
   # instead of the articulation's range-proportional 0.9 factor. This lets the
   # 130deg folded-elbow default sit inside the soft limit (140 - 7 = 133deg).
+  # Balance assist: an external spring-damper torque that pushes a tilted
+  # trunk back upright, so the policy can try lifting a foot without falling.
+  # It is spread over every body as a rigid-body rotation and applied each
+  # physics step -- on the 0.56 kg base link alone, or refreshed once per
+  # control step, these gains make the simulation diverge.
+  # A manual switch, not a curriculum:
+  #   - BALANCE_ASSIST_SCALE below: 0 = off, 1 = full strength.
+  #   - while training is running, write a number into BALANCE_ASSIST_SCALE_FILE
+  #     (e.g. `echo 0.5 > balance_assist_scale.txt` in the repo root) to change
+  #     it without restarting; it is re-read every 200 env steps and overrides
+  #     the value here. Delete the file to fall back to BALANCE_ASSIST_SCALE.
+  # Gains are set for a critically damped return at scale 1, modelling the
+  # robot as an inverted pendulum tipping about its feet: m*g*h = 24.4 Nm/rad
+  # (6.32 kg, COM 0.394 m up) and I = 1.21 kg m^2 about a ground pivot (roll
+  # 1.215, pitch 1.196). With a natural frequency of 7 rad/s (~0.7 s to settle):
+  #   stiffness = m*g*h + I*wn^2 = 83.5,  damping = 2*I*wn = 16.9
+  # The damping ratio stays 0.92-1.02 down to scale 0.4; below scale 0.29 the
+  # assist is weaker than gravity and only slows a fall.
+  # Not used in play, and a policy must finish training at 0.
+  if not play and BALANCE_ASSIST_SCALE is not None:
+    cfg.events["balance_assist"] = EventTermCfg(
+      func=balance_assist,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "scale": BALANCE_ASSIST_SCALE,
+        "stiffness": 83.5,
+        "damping": 16.9,
+        "max_torque": 40.0,
+        "scale_file": BALANCE_ASSIST_SCALE_FILE,
+        "reload_every": 200,
+      },
+    )
   cfg.events["soft_joint_pos_limit_margin"] = EventTermCfg(
     mode="startup",
     func=set_soft_joint_pos_limit_margin,
@@ -1566,8 +1674,8 @@ def make_kid_rl_velocity_env_cfg(
   # *_cap and four *_actual passive joints can each use their own scale range.
   # All eight have armature=1e-3 in the current robot XML.
   _actuated_armature_range = (0.6, 1.4) if DR_WIDE else (0.9, 1.1)
-  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
-  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.7, 1.3)
+  _cap_armature_range = (0.6, 1.4) if DR_WIDE else (0.5, 1.3)
+  _actual_armature_range = (0.6, 1.4) if DR_WIDE else (0.5, 1.3)
   cfg.events["dof_armature_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_armature,
@@ -1598,8 +1706,8 @@ def make_kid_rl_velocity_env_cfg(
 
   # BAM owns the 25 driven joints' friction. The passive cap/actual joints
   # are not BAM targets, so randomize their XML-authored frictionloss directly.
-  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
-  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.3, 1.2)
+  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.3, 1.2)
   cfg.events["dof_cap_friction_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_friction,
@@ -1684,11 +1792,11 @@ def make_kid_rl_velocity_env_cfg(
         threshold_start=0.23,
         threshold_end=3.0,
         push_full_scale={
-          "x": 0.22,
-          "y": 0.22,
-          "roll": 0.22,
-          "pitch": 0.22,
-          "yaw": 0.22,
+          "x": 0.5,
+          "y": 0.5,
+          "roll": 0.5,
+          "pitch": 0.5,
+          "yaw": 0.5,
         },
       ),
     },
@@ -1808,9 +1916,9 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
       "slices": [(0, 3, CAPS_GYRO_STD), (31, 56, CAPS_JOINT_VEL_STD)],
     },
     symmetry_cfg={
-      "use_data_augmentation": False,
+      "use_data_augmentation": True,
       "use_mirror_loss": True,
-      "mirror_loss_coeff": 0.2,
+      "mirror_loss_coeff": 0.1,
       "data_augmentation_func": compute_symmetric_states,
     },
   ),
