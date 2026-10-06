@@ -226,6 +226,12 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
 # specifies (no mixing).
 _FOOT_PATTERN = r".*_foot_collision_.*"
 
+# The sole plate (the big box the four studs hang under). It must not touch the
+# ground -- the foot stands on its studs only -- but still has to stop the feet
+# and legs passing through each other. Collision bit 2 does that: the terrain
+# has only bit 1, every other robot collider below carries bits 1|2.
+_FOOT_SOLE_PATTERN = r"^(left|right)_foot_collision_1$"
+
 # Invisible 5 mm extensions on only the inward face of each foot. Private
 # collision bit 32 lets the two proxies contact each other without touching
 # terrain or other robot geoms.
@@ -261,8 +267,23 @@ FULL_COLLISION = CollisionCfg(
   # contype/conaffinity: feet and self-collision geoms fall back to the CollisionCfg
   # default (1). The linkage geoms must keep 16 explicitly or they'd be reset to 1
   # and start colliding with the floor/rest of the robot instead of just themselves.
-  contype={_FOOT_INNER_SAFETY_PATTERN: 32, _LINKAGE_PATTERN: 16},
-  conaffinity={_FOOT_INNER_SAFETY_PATTERN: 32, _LINKAGE_PATTERN: 16},
+  # Sole plate: bit 2 only (robot yes, terrain no); it must be listed first
+  # because the later patterns also match its name. Studs, ankle block and
+  # self-collision proxies: 3 = terrain bit 1 | robot bit 2.
+  contype={
+    _FOOT_SOLE_PATTERN: 2,
+    _FOOT_INNER_SAFETY_PATTERN: 32,
+    _LINKAGE_PATTERN: 16,
+    _FOOT_PATTERN: 3,
+    _SELF_COLLISION_PATTERN: 3,
+  },
+  conaffinity={
+    _FOOT_SOLE_PATTERN: 2,
+    _FOOT_INNER_SAFETY_PATTERN: 32,
+    _LINKAGE_PATTERN: 16,
+    _FOOT_PATTERN: 3,
+    _SELF_COLLISION_PATTERN: 3,
+  },
   condim={
     _FOOT_PATTERN: 3,
     _FOOT_INNER_SAFETY_PATTERN: 1,
