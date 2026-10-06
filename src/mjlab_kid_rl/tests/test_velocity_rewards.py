@@ -231,12 +231,17 @@ class TestAirborneFootArmSwingReward(unittest.TestCase):
     self.command[:] = torch.tensor([[0.0, 0.0, 0.0]])
     torch.testing.assert_close(self._reward(), torch.tensor([-0.34]))
 
-  def test_straight_forward_uses_arm_alignment_instead_of_action_cost(self) -> None:
+  def test_straight_forward_charges_only_non_swing_arm_actions(self) -> None:
     self.command[:] = torch.tensor([[0.2, 0.1, 0.0]])
     self.sensor.data.found[:] = torch.tensor([[False, True]])
     self.asset.data.joint_pos[:] = 0.25
-    self.arm_action.raw_action[:] = 1.0
+    # Shoulder pitch actions (the swing) are free under a straight command.
+    self.arm_action.raw_action[0, 0] = 1.0  # left shoulder pitch
+    self.arm_action.raw_action[0, 5] = 1.0  # right shoulder pitch
     torch.testing.assert_close(self._reward(), torch.ones(1))
+    # The other eight arm joints (shoulder roll/yaw, elbow, wrist) are charged.
+    self.arm_action.raw_action[:] = 1.0
+    torch.testing.assert_close(self._reward(), torch.tensor([-7.0]))
 
   def test_zero_when_both_feet_share_contact_state(self) -> None:
     self.command[:, 0] = 0.2
@@ -687,15 +692,14 @@ class TestNotSteppingEachFootPenalty(unittest.TestCase):
       max_time_without_lift_s=2.0,
     )
 
-  def test_each_overdue_foot_is_charged_every_step_until_it_lifts(self) -> None:
+  def test_each_overdue_foot_emits_once_per_interval(self) -> None:
     for _ in range(99):
       torch.testing.assert_close(self._penalty(), torch.zeros(1))
-    for _ in range(50):
-      torch.testing.assert_close(self._penalty(), torch.tensor([2.0]))
-    self.contact.data.found[0, 0] = False
-    torch.testing.assert_close(self._penalty(), torch.tensor([1.0]))
-    self.contact.data.found[0, 0] = True
-    torch.testing.assert_close(self._penalty(), torch.tensor([1.0]))
+    torch.testing.assert_close(self._penalty(), torch.tensor([2.0]))
+    torch.testing.assert_close(self._penalty(), torch.zeros(1))
+    for _ in range(98):
+      self._penalty()
+    torch.testing.assert_close(self._penalty(), torch.tensor([2.0]))
 
   def test_contact_loss_resets_only_that_foot(self) -> None:
     for _ in range(90):
