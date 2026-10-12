@@ -49,6 +49,7 @@ from mjlab_kid_rl.tasks.mdp import (
   balance_assist,
   airborne_foot_arm_swing_reward,
   feet_distance_penalty,
+  base_height_exp,
   base_height_penalty,
   feet_crossing_reward,
   foot_flatness_penalty,
@@ -65,7 +66,11 @@ from mjlab_kid_rl.tasks.mdp import (
   gait_phase_contact_reward,
   imu_gyro_lowpass,
   joint_vel_window_avg,
+  randomize_bam_friction,
   randomize_bam_kp,
+  randomize_contact_solref,
+  randomize_joint_backlash,
+  track_yaw_velocity_exp,
   gait_phase_swing_clearance_reward,
   swing_progress_reward,
   gait_symmetry_reward,
@@ -83,6 +88,7 @@ from mjlab_kid_rl.tasks.mdp import (
   set_push_parameters,
   make_interpolated_push_stages,
   reward_based_staged_curriculum,
+  action_target_limit_excess_l2,
   selected_action_excess_l2,
   upper_body_excursion_penalty,
   settled_standing_penalty,
@@ -472,9 +478,68 @@ BALANCE_ASSIST_SCALE_FILE = "balance_assist_scale.txt"
 """If this file exists (path relative to where training is launched), the number
 in it overrides BALANCE_ASSIST_SCALE and is re-read while training runs."""
 
+STUD_CONTACT_SOLREF_RANGES: tuple[tuple[float, float], tuple[float, float]] | None = (
+  (0.010, 0.020),
+  (0.3, 1.0),
+)
+"""스터드와 바닥 접촉의 (시간상수 범위 [s], 감쇠비 범위). None 이면 끈다 (MuJoCo 기본 0.02 / 1).
+
+시간상수는 환경마다 하나를 뽑아 그 로봇의 스터드 8개에 같이 쓰고, 감쇠비는 스터드마다 따로 뽑는다. 기본값(20 ms, 감쇠비 1)은 발이 닿으면 튀지 않고
+가라앉는 무른 접촉이라, 실기처럼 딱딱한 스터드가 딱딱한 바닥을 칠 때의 짧은 충격과 착지 후 떨림이 없다.
+시간상수가 짧을수록 딱딱하고, 감쇠비가 1 보다 작으면 착지 후 약 1 / (2*pi*시간상수*감쇠비) Hz 로 떨린다
+(15 ms / 0.7 -> 15 Hz, 10 ms / 0.3 -> 53 Hz). 시간상수 하한 10 ms 는 물리 스텝 5 ms 의 2 배로, MuJoCo 가
+그 아래는 잘라 버린다. 2026-10-08 실기 자이로는 10~15 Hz 대역이 sim 의 2~3 배였다."""
+
+STUD_HEIGHT_OFFSET_M: float | None = 0.0015
+"""스터드 8개 각각의 높이를 환경마다 [-값, +값] 만큼 따로 어긋나게 한다 [m]. None 이면 끈다.
+
+네 점으로 딛는 발은 스터드 높이가 조금만 달라도 세 점으로만 서서 까딱거린다. 모델의 스터드는 완전히 같은
+높이라 그 흔들림이 없다. 2026-10-12 실기는 걷는 중 몸통 roll 이 2 Hz 아래에서 sim 의 3~9 배(4 Hz 위는 같음).
+발판(*_foot_collision_1)은 스터드 바닥보다 3.5 mm 위라 1.5 mm 까지는 발판이 먼저 닿지 않는다."""
+
+BAM_FRICTION_SCALE_RANGE: tuple[float, float] | None = None
+"""구동 관절(BAM) 마찰 배율 범위. 환경마다, 관절마다 따로 뽑는다(로그 균등). None 이면 끈다.
+
+2026-10-12 까지 구동 관절 마찰은 랜덤화가 없었다(수동 링크 관절만 있었다). 실기에서 굳은 순간 20 개를 sim 에
+옮겨 같은 정책을 돌리면 마찰 x1~1.6 에서는 18 개가 걸어 나오지만 x2 는 걷는 비율 78%, x2.5 는 41%(7 개 넘어짐),
+x3 은 기본 자세에서 출발해도 0% 였다. 바닥 마찰(0.3~2.5)과는 무관했다. 실기 걷는 비율(56~66%)은 x2~2.5 에 해당한다.
+단, 실기 마찰이 그만큼 크다는 것은 확인되지 않았다: 공중 로그(air1005)를 같은 목표로 재생하면 전체로는 x1 이
+가장 잘 맞고(평균 오차 0.051 / x2 0.057 / x3 0.084 rad) 무릎·발목 pitch 만 x2 가 조금 낫다. 하중이 걸렸을 때의
+마찰은 재지 못했다. 땅 위 로그에서 "관절이 안 움직이는 동안 목표 오차가 얼마나 변했나"를 실기와 sim 으로 비교해도
+차이가 없었다(p90 0.18~0.32 대 0.16~0.52 rad). 실기 마찰이 크다는 근거가 없어 꺼 둔다. 켜려면 (0.7, 2.5)."""
+
+JOINT_BACKLASH_HALFWIDTH_RAD: tuple[float, float] | None = (0.0, 0.01)
+"""관절 유격의 반폭 범위 [rad]. 환경마다, 관절마다 따로 뽑는다. None 이면 끈다.
+
+목표에서 +-반폭 안에서는 모터가 힘을 내지 않아 관절이 하중에 따라 자유롭게 움직인다(전체 유격 = 반폭의 2 배).
+0.01 rad 는 전체 유격 1.15 도. Dynamixel MX/XH 사양 유격은 0.25~0.33 도(반폭 0.002~0.003 rad)이고,
+마모와 링크 조립 유격을 감안해 그 3~4 배까지 잡았다. 실측값이 아니다."""
+
+RESET_BASE_ANG_VEL_RAD_S: float | None = 0.5
+"""에피소드 시작 때 몸통 roll/pitch 각속도를 [-값, +값] 에서 뽑는다 [rad/s]. None 이면 0 으로 시작.
+
+시작 기울기(+-10 도)와 함께, 실기처럼 크게 흔들리는 중의 상태에서 출발하게 한다. 실기 걷는 중 자이로는
+roll/pitch 0.3~0.6 rad/s (표준편차)."""
+
+TORSO_TORQUE_DISTURBANCE_NM = 0.0
+"""몸통(base_link)에 계속 걸리는 무작위 외부 토크의 크기 [N*m]. None 이면 끈다.
+
+축마다 균등분포 [-값, +값] 을 뽑아 0.3~1.0 초마다 바꾼다. 간헐적 밀기(push_robot)와 달리 걷는 내내
+작용한다. 2026-10-08 실기는 걷는 중 몸통이 roll 5.7 / pitch 5.3 도(표준편차)로 계속 흔들리는데 교란 없는
+sim 은 2.1 / 1.2 도였다. 같은 모델(51500)에 이 교란을 걸어 본 결과:
+  0.25 -> 2.2 / 1.4 도,  0.5 -> 2.3 / 1.9 도 (150 초 생존),  0.75 -> 13 초에 앞으로 넘어짐,  1.0 -> 12 초
+즉 그 모델은 실기 수준의 흔들림에 도달하기 전에 넘어진다. 0.7 은 그 한계 바로 위에서 시작하는 값이고,
+넘어짐이 줄면 1.0 -> 1.5 로 올려 sim 흔들림이 실기(5~6 도)에 가까워지게 한다.
+balance_assist 가 켜져 있으면(scale > 0) 그쪽이 매 물리 스텝 외력을 덮어써서 이 교란은 사라진다."""
+
 USE_GAIT_PHASE = False
 """보행 위상(gait_phase) 관측과 위상 보상(gait_phase_contact, gait_phase_swing_clearance) 사용 여부.
-2026-09-30 재학습부터 끈다. 실기 컨트롤러는 모델 메타데이터로 84/86 차원을 자동 판별한다."""
+2026-09-30 재학습부터 껐다가 2026-10-12 다시 켠다: 실기에서 명령이 있는데도 정책이 같은 목표만 내며 굳는 구간이
+22~45% 였다. 굳은 순간의 자세를 sim 에 그대로 옮기면 같은 정책이 20 개 중 18 개에서 0.2 초 만에 걸어 나왔다 --
+정책은 기억이 없어 입력이 안 변하면 출력도 안 변하는데, 시계는 몸이 안 움직여도 입력을 매 틱 바꾼다.
+84 차원 체크포인트는 첫 층에 0 가중치 열 2 개를 붙여 이어 쓴다.
+같은 날 다시 끈다: 2400 회 학습한 위상 모델은 실기에서 굳는 구간이 24% -> 11% 로 줄었지만 옆걸음이 나빠지고
+흔들림은 그대로였다. 위상 없는 98200 번 체크포인트(2026-10-12_03-57-04)에서 CAPS 를 줄여 이어 간다. 실기 컨트롤러는 모델 메타데이터로 84/86 차원을 자동 판별한다."""
 
 IMU_GYRO_FILTER_HZ = 6.0
 """actor gyro 관측 저역통과 컷오프. deploy_ws kid_rl controllers.yaml imu_gyro_filter_hz 와 같아야 한다."""
@@ -524,6 +589,11 @@ class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
 
     for event_name in (
       "push_robot",
+      "stud_contact_solref",
+      "stud_height_offset",
+      "joint_backlash",
+      "bam_friction_scale",
+      "torso_torque_disturbance",
       "foot_friction",
       "left_hip_contact_friction",
       "right_hip_contact_friction",
@@ -808,10 +878,10 @@ def make_kid_rl_velocity_env_cfg(
   #
   # With the reward's double-support band b, a leg is in stance for
   # 0.5 + arcsin(b)/pi of the cycle (exact, verified against a numerical sweep),
-  # so swing is the complement. At b=0.1 that is 0.4681, giving a 0.854 s cycle
-  # for a 0.4 s swing and a 0.427 s step period.
+  # so swing is the complement. At b=0.1 that is 0.4681, giving a 1.175 s cycle
+  # for a 0.55 s swing and a 0.587 s step period.
   _GAIT_DOUBLE_SUPPORT_BAND = 0.1
-  _GAIT_SWING_TIME = 0.4
+  _GAIT_SWING_TIME = 0.45
   _GAIT_SWING_FRACTION = 0.5 - np.arcsin(_GAIT_DOUBLE_SUPPORT_BAND) / np.pi
   _GAIT_CYCLE_TIME = float(_GAIT_SWING_TIME / _GAIT_SWING_FRACTION)
   if USE_GAIT_PHASE:
@@ -834,10 +904,14 @@ def make_kid_rl_velocity_env_cfg(
     "std": np.sqrt(0.1),
   }
   cfg.rewards["track_linear_velocity"].weight = 3.0
-  cfg.rewards["track_angular_velocity"].func = mdp.track_angular_velocity
+  # 2026-10-12: yaw 만 보는 추종으로 바꾸고 std^2 0.2 -> 0.06. 이전 설정에서는 회전 명령 0.3 rad/s 를
+  # 무시하고 서 있어도 보상의 64% 를 받았고(0.7 에서는 9%), 발을 구르면 몸통 roll/pitch 각속도 때문에
+  # 오히려 깎였다. 그 결과 2026-10-11 모델은 sim 에서 회전 명령에 전혀 돌지 않았다.
+  # 새 값에서는 서 있으면 0.3 에서 22%, 0.7 에서 0% 다.
+  cfg.rewards["track_angular_velocity"].func = track_yaw_velocity_exp
   cfg.rewards["track_angular_velocity"].params = {
     "command_name": "twist",
-    "std": np.sqrt(0.2),
+    "std": np.sqrt(0.06),
   }
   cfg.rewards["track_angular_velocity"].weight = 2.0
 
@@ -924,9 +998,9 @@ def make_kid_rl_velocity_env_cfg(
   # The target comes from robot.data.default_joint_pos; walking is unaffected.
   cfg.rewards["default_joint_pose"] = RewardTermCfg(
     func=default_joint_pose_exp,
-    weight=1.0,
+    weight=3.0,
     params={
-      "std": 0.15,
+      "std": 0.1,
       "command_name": "twist",
       "walking_threshold": walking_threshold,
       "asset_cfg": SceneEntityCfg("robot", joint_names=(DOFS_FILTER,)),
@@ -948,7 +1022,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("base_link",)
   # Same quantity as cyclo_lab's ang_vel_xy_l2 (base roll/pitch rate squared),
   # at that task's weight.
-  cfg.rewards["body_ang_vel"].weight = -0.4
+  cfg.rewards["body_ang_vel"].weight = -1.0
   cfg.rewards["angular_momentum"].weight = -0.1
 
   cfg.rewards["foot_clearance"].params["asset_cfg"].site_names = tuple(foot_site_names)
@@ -979,7 +1053,7 @@ def make_kid_rl_velocity_env_cfg(
   # Before 0.3 s the per-step pay ramps linearly from 0 (just lifted) to 1, so
   # a short swing still earns more the longer the foot stays up.
   # Landing and overlong swings receive no air-time reward.
-  cfg.rewards["air_time"].weight = 1.5
+  cfg.rewards["air_time"].weight = 1.0
   # Two stepping terms from ROBOTIS cyclo_lab's K1 velocity task (which walks
   # without a gait clock), with that task's weights. The stand test is this
   # task's own (planar speed + |yaw rate| <= walking_threshold).
@@ -989,7 +1063,7 @@ def make_kid_rl_velocity_env_cfg(
   # continued stepping keeps it. It needs no memory of which foot stepped last.
   cfg.rewards["feet_single_contact"] = RewardTermCfg(
     func=feet_single_contact_reward,
-    weight=1.0,
+    weight=0.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1118,7 +1192,16 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
     weight=-200.0,
-    params={"minimum_height": 0.35},
+    params={"minimum_height": 0.40},
+  )
+
+  # Reward standing at the default pose's base height. 0.413 m is where the base
+  # settles with every joint target at HOME_KEYFRAME (measured 2026-10-11, flat
+  # ground, stud feet); std 2 cm, so 2 cm off already drops the reward to 0.37.
+  cfg.rewards["base_height_exp"] = RewardTermCfg(
+    func=base_height_exp,
+    weight=0.1,
+    params={"target_height": 0.413, "std": 0.02},
   )
 
   # A hard cap on how far the upper body may swing off HOME_KEYFRAME, covering
@@ -1261,7 +1344,7 @@ def make_kid_rl_velocity_env_cfg(
   # of landed swings. Holding one foot up does not pay each step.
   cfg.rewards["swing_progress"] = RewardTermCfg(
     func=swing_progress_reward,
-    weight=1.0,
+    weight=0.8,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1284,6 +1367,10 @@ def make_kid_rl_velocity_env_cfg(
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
+      # Ignore landings after under 2 control steps in the air: with foot
+      # friction down to 0.3 a sliding stance foot flickers off the ground and
+      # this term tripled (0.7 -> 2.0 per second) on that alone.
+      "min_air_time": 0.0,
     },
   )
 
@@ -1384,7 +1471,7 @@ def make_kid_rl_velocity_env_cfg(
   # and diagonal steps; see forward_step_reward for the frame conversion.
   cfg.rewards["forward_step"] = RewardTermCfg(
     func=forward_step_reward,
-    weight=0.0,
+    weight=10.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1413,7 +1500,7 @@ def make_kid_rl_velocity_env_cfg(
   # is switched off (base_scale 0); base motion is left to velocity tracking.
   cfg.rewards["lateral_swing_progress"] = RewardTermCfg(
     func=lateral_swing_progress_reward,
-    weight=30.0,
+    weight=20.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1462,13 +1549,26 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["joint_torques_l2"] = RewardTermCfg(
     func=envs_mdp.joint_torques_l2,
-    weight=-1.0e-4,
+    weight=-0.0,
     params={"asset_cfg": SceneEntityCfg("robot")},
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
     weight=-0.0,
     params={},
+  )
+  # Charge every joint for asking for a target beyond its own soft limit (rad^2
+  # over, summed). Past the limit a larger action moves nothing, so without this
+  # the policy can run the action up for free and then reads that value back as
+  # its previous action -- on the robot that ended with actions near 15 and the
+  # legs pinned at their stops.
+  # Leg joints only: the folded elbows and the wrists rest 0.1 action units from
+  # a limit, so on them this charged exploration noise (about 0.15 of the 0.2
+  # per-second penalty the term logged) instead of behaviour.
+  cfg.rewards["action_target_limit_excess"] = RewardTermCfg(
+    func=action_target_limit_excess_l2,
+    weight=-30.0,
+    params={"action_name": "joint_pos", "joint_names": (LEG_DOFS_FILTER,)},
   )
   cfg.rewards["roll_action_excess_l2"] = RewardTermCfg(
     func=selected_action_excess_l2,
@@ -1500,25 +1600,28 @@ def make_kid_rl_velocity_env_cfg(
   # Match the 20 s episode horizon: reset samples one fresh command and the
   # timeout resets the environment before an in-episode resample can occur.
   # Both bounds are required; ``(20.0)`` would be a float, not a one-item tuple.
-  command.resampling_time_range = (20.0, 20.0)
-  command.rel_standing_envs = 0.1
+  command.resampling_time_range = (1.0, 5.0)
+  command.rel_standing_envs = 0.2
   command.rel_heading_envs = 0.0
-  command.rel_rotation_envs = 0.1
+  command.rel_rotation_envs = 0.2
   # Exclusive fractions of all environments: standing/rotation/forward/backward
   # each take 10%, lateral-only and diagonal planar translation each take 30%.
   # These sum to 100%, leaving no mixed vx/vy/wz commands during training.
+  # 2026-10-12: standing 0.2 + rotation 0.2 + forward 0.1 + backward 0.1 + lateral 0.1 + planar 0.1
+  # = 0.8. 채우지 않은 0.2 는 부모 클래스의 혼합 샘플(vx, vy, wz 를 각 범위에서 동시에 뽑음)을
+  # 그대로 받으므로, 이동하면서 회전하는 명령이 된다.
   command.rel_forward_only_envs = 0.1
   command.rel_backward_only_envs = 0.1
-  command.rel_lateral_only_envs = 0.3
-  command.rel_planar_only_envs = 0.3
+  command.rel_lateral_only_envs = 0.1
+  command.rel_planar_only_envs = 0.1
   command.directional_min_lin_vel = 0.05
   # Use this task's explicit forward-only sampler instead of the template's
   # separate forward-mode distribution.
   command.rel_forward_envs = 0.0
   # Fixed command envelope. Curriculum difficulty comes from push magnitude and
   # tighter tracking tolerances, not from changing the command distribution.
-  command.ranges.lin_vel_x = (-0.4, 0.4)
-  command.ranges.lin_vel_y = (-0.3, 0.3)
+  command.ranges.lin_vel_x = (-0.5, 0.5)
+  command.ranges.lin_vel_y = (-0.4, 0.4)
   command.ranges.ang_vel_z = (-0.7, 0.7)
   command.rotation_env_ang_vel_range = (-0.7, 0.7)
   command.rotation_min_ang_vel = 0.3
@@ -1526,9 +1629,15 @@ def make_kid_rl_velocity_env_cfg(
   # ---------------------------- Events ----------------------------
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
   # Sample initial base roll and pitch in either direction.
-  init_tilt = float(np.deg2rad(0.0))
+  init_tilt = float(np.deg2rad(10.0))
   cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
   cfg.events["reset_base"].params["pose_range"]["pitch"] = (-init_tilt, init_tilt)
+  if RESET_BASE_ANG_VEL_RAD_S is not None:
+    ang = RESET_BASE_ANG_VEL_RAD_S
+    cfg.events["reset_base"].params["velocity_range"] = {
+      "roll": (-ang, ang),
+      "pitch": (-ang, ang),
+    }
   # Randomize only the actuated leg joints. The passive roll-linkage followers
   # are constrained by the mechanism and must not be offset independently, and
   # the arms/torso/head start at HOME: with the elbows folded to 130deg a
@@ -1536,8 +1645,8 @@ def make_kid_rl_velocity_env_cfg(
   # of resets.
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.0, 0.0),
-      "velocity_range": (-0.0, 0.0),
+      "position_range": (-0.15, 0.15),
+      "velocity_range": (-0.3, 0.3),
       "asset_cfg": SceneEntityCfg("robot", joint_names=(LEG_DOFS_FILTER,)),
     }
   )
@@ -1553,23 +1662,27 @@ def make_kid_rl_velocity_env_cfg(
       "asset_cfg": SceneEntityCfg("robot", joint_names=(UPPER_BODY_DOFS_FILTER,)),
     },
   )
-  # Push velocity is zero initially and at every curriculum stage below.
+  # Fixed push strength, no curriculum: each push adds a velocity drawn
+  # uniformly from these ranges, independently per axis. All zeros = off.
   # DR_WIDE still controls the other DR ranges.
+  # (min, max) per axis. (0.3, 0.3) pushed every env the same way every time;
+  # a symmetric range is what makes the push direction random.
   cfg.events["push_robot"].params["velocity_range"] = {
-    "x": (0.0, 0.0),
-    "y": (0.0, 0.0),
-    "roll": (0.0, 0.0),
-    "pitch": (0.0, 0.0),
+    "x": (-0.2, 0.2),
+    "y": (-0.2, 0.2),
+    "z": (-0.2, 0.2),
+    "roll": (-0.2, 0.2),
+    "pitch": (-0.2, 0.2),
+    "yaw": (-0.2, 0.2),
   }
-  cfg.events["push_robot"].interval_range_s = (15.0, 20.0)
+  cfg.events["push_robot"].interval_range_s = (5.0, 10.0)
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
     r".*left_foot_collision.*",
     r".*right_foot_collision.*",
   )
-  # Raised the low end from mjlab's default 0.3 -- that's wet-tile-slippery and
-  # was a plausible contributor to fell_over alongside the other issues found
-  # this session (double curriculum, action-std runaway). 0.6 still gives real
-  # low-friction variety without handing every env a near-ice floor.
+  # 2026-10-12: 0.25~0.8 로 낮춰 학습해 봤다가 0.8~1.2 로 되돌림. 낮은 마찰 가설의 근거는 "sim 마찰을
+  # 0.1~0.15 로 낮추면 실기처럼 다리가 벌어진다"였는데, 실기를 마찰이 더 높은 바닥에서 돌려도
+  # 결과가 같았다 (hip roll 실제/목표 움직임 0.81 -> 0.74, 명령 중 정지 65% -> 56%).
   cfg.events["foot_friction"].params["ranges"] = (0.8, 1.2)
   for side in ("left", "right"):
     for joint in ("hip", "ankle"):
@@ -1587,7 +1700,7 @@ def make_kid_rl_velocity_env_cfg(
             ),
           ),
           "operation": "scale",
-          "ranges": (0.7, 1.3),
+          "ranges": (0.3, 1.3),
         },
       )
   # 5 mm is ~1% of this 0.476 m robot's height, arguably tighter than the real
@@ -1645,6 +1758,17 @@ def make_kid_rl_velocity_env_cfg(
         "max_torque": 40.0,
         "scale_file": BALANCE_ASSIST_SCALE_FILE,
         "reload_every": 200,
+      },
+    )
+  if not play and TORSO_TORQUE_DISTURBANCE_NM is not None:
+    cfg.events["torso_torque_disturbance"] = EventTermCfg(
+      func=envs_mdp.apply_external_force_torque,
+      mode="interval",
+      interval_range_s=(0.3, 1.0),
+      params={
+        "force_range": (0.0, 0.0),
+        "torque_range": (-TORSO_TORQUE_DISTURBANCE_NM, TORSO_TORQUE_DISTURBANCE_NM),
+        "asset_cfg": SceneEntityCfg("robot", body_names=("base_link",)),
       },
     )
   cfg.events["soft_joint_pos_limit_margin"] = EventTermCfg(
@@ -1709,8 +1833,8 @@ def make_kid_rl_velocity_env_cfg(
 
   # BAM owns the 25 driven joints' friction. The passive cap/actual joints
   # are not BAM targets, so randomize their XML-authored frictionloss directly.
-  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
-  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.6, 1.4)
+  _cap_friction_range = (0.5, 1.5) if DR_WIDE else (0.3, 1.2)
+  _actual_friction_range = (0.5, 1.5) if DR_WIDE else (0.3, 1.2)
   cfg.events["dof_cap_friction_randomization"] = EventTermCfg(
     mode="startup",
     func=dr.joint_friction,
@@ -1742,6 +1866,53 @@ def make_kid_rl_velocity_env_cfg(
   #   - MX-64 (torso/hip yaw): 실기가 sim 보다 덜 움직임(느린 동작 추종비 0.15 vs 0.30) --
   #     약한 쪽을 포함해 0.7~1.1.
   #   - MX-28 (팔/목): 비교 근거 없음, 0.9~1.2.
+  if STUD_CONTACT_SOLREF_RANGES is not None:
+    cfg.events["stud_contact_solref"] = EventTermCfg(
+      mode="startup",
+      func=randomize_contact_solref,
+      params={
+        "asset_cfg": SceneEntityCfg(
+          "robot", geom_names=(r"^(left|right)_foot_collision_stud_\d+$",)
+        ),
+        "timeconst_range": STUD_CONTACT_SOLREF_RANGES[0],
+        "dampratio_range": STUD_CONTACT_SOLREF_RANGES[1],
+        "per_geom_dampratio": True,
+        # 10 ms / 0.3 (53 Hz) 은 5 ms 스텝에서 수치적으로 깨져 0.3 초 만에 넘어진다.
+        # 시간상수 x 감쇠비가 4.5 ms 아래로 가지 않게 감쇠비를 올린다 (떨림 35 Hz 이하).
+        "min_product": 0.0045,
+      },
+    )
+  if STUD_HEIGHT_OFFSET_M is not None:
+    cfg.events["stud_height_offset"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_pos,
+      params={
+        "asset_cfg": SceneEntityCfg(
+          "robot", geom_names=(r"^(left|right)_foot_collision_stud_\d+$",)
+        ),
+        "operation": "add",
+        "axes": [2],
+        "ranges": (-STUD_HEIGHT_OFFSET_M, STUD_HEIGHT_OFFSET_M),
+      },
+    )
+  if BAM_FRICTION_SCALE_RANGE is not None:
+    cfg.events["bam_friction_scale"] = EventTermCfg(
+      mode="startup",
+      func=randomize_bam_friction,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "scale_range": BAM_FRICTION_SCALE_RANGE,
+      },
+    )
+  if JOINT_BACKLASH_HALFWIDTH_RAD is not None:
+    cfg.events["joint_backlash"] = EventTermCfg(
+      mode="startup",
+      func=randomize_joint_backlash,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "halfwidth_range": JOINT_BACKLASH_HALFWIDTH_RAD,
+      },
+    )
   cfg.events["bam_kp_randomization"] = EventTermCfg(
     mode="startup",
     func=randomize_bam_kp,
@@ -1782,28 +1953,29 @@ def make_kid_rl_velocity_env_cfg(
 
   # ---------------------------- Curriculum ------------------------
   # Keep the velocity-command distribution and tracking std values fixed.
-  # Only the push magnitude increases through this curriculum.
   # Remove the template command curriculum so it cannot overwrite the fixed
   # command ranges above; terrain curriculum remains enabled.
   del cfg.curriculum["command_vel"]
-  cfg.curriculum["staged_curriculum"] = CurriculumTermCfg(
-    func=reward_based_staged_curriculum,
-    params={
-      "stages": make_interpolated_push_stages(
-        num_stages=6,
-        reward_term_name="track_linear_velocity",
-        threshold_start=0.23,
-        threshold_end=3.0,
-        push_full_scale={
-          "x": 0.5,
-          "y": 0.5,
-          "roll": 0.5,
-          "pitch": 0.5,
-          "yaw": 0.5,
-        },
-      ),
-    },
-  )
+  # Push curriculum disabled 2026-10-08: pushes are off (see push_robot in Events).
+  # cfg.curriculum["staged_curriculum"] = CurriculumTermCfg(
+  #   func=reward_based_staged_curriculum,
+  #   params={
+  #     "stages": make_interpolated_push_stages(
+  #       num_stages=6,
+  #       reward_term_name="track_linear_velocity",
+  #       threshold_start=0.23,
+  #       threshold_end=3.0,
+  #       push_full_scale={
+  #         "x": 1.0,
+  #         "y": 1.0,
+  #         "z": 1.0,
+  #         "roll": 1.0,
+  #         "pitch": 1.0,
+  #         "yaw": 1.0,
+  #       },
+  #     ),
+  #   },
+  # )
 
   # Both of these read state that only exists under terrain_type="generator";
   # see the Terrain section above for why each one has to go with a plane.
@@ -1844,10 +2016,21 @@ def make_kid_rl_velocity_env_cfg(
 # under-sized here. Revisit empirically (via ablation) if training is slow/unstable,
 # not by recomputing from observation size.
 # CAPS coefficients are starting values, not validated real-robot tuning.
-CAPS_SPATIAL_COEF = 0.1
-CAPS_TEMPORAL_COEF = 0.03
-CAPS_GYRO_STD = 0.3  # rad/s, before actor observation normalization
-CAPS_JOINT_VEL_STD = 0.3
+CAPS_SPATIAL_COEF = 0.0
+CAPS_TEMPORAL_COEF = 0.0
+"""2026-10-12: CAPS 를 완전히 끈다(이전 0.1 / 0.03). 둘 다 0 이면 SmoothPPO 는 평활화 손실 없이 PPO 에
+좌우 대칭 augmentation 과 mirror loss 만 더한 것으로 돈다. 아래 외란 크기는 계수가 0 인 동안 쓰이지 않는다."""
+CAPS_GYRO_STD = 0.1  # rad/s, before actor observation normalization
+"""2026-10-12: 세 외란 크기를 1/3 로 줄였다 (gyro 0.3 -> 0.1, joint_pos 0.03 -> 0.01, joint_vel 0.3 -> 0.1).
+실기 걷는 중 obs 865 개에 그 크기의 외란을 주면 다리 action 이 gyro 0.019, joint_pos 0.031, joint_vel 0.025 만
+변했다(목표각으로는 그 절반). 실기 걷는 중 자이로가 0.2~0.6 rad/s 로 흔들리므로 0.3 은 잡음이 아니라 실제 흔들림
+신호를 무시하게 만드는 크기였다. 아래 두 설명의 0.03 / 0.3 은 처음 넣을 때의 값이다. 다시 발진하면 되돌릴 것."""
+CAPS_JOINT_POS_STD = 0.01
+"""CAPS 공간 외란: actor joint_pos 칸(rad, 정규화 전). 2026-10-07 실기에서 action_acc 벌점 없이 학습한
+모델이 8.4 Hz 로 발진했다. 그 모델은 무릎 관절각 0.1 rad 변화에 다리 목표각을 0.32 rad 바꿨다
+(이전 모델 0.09 rad). gyro/joint_vel 만 누르던 CAPS 에 관절각을 추가해 이 경로의 민감도를 직접 깎는다.
+0.03 rad 는 실기 SAFE_HOLD 관절 오차(0.05~0.1 rad)보다 작게 잡은 시작값이며 검증된 값이 아니다."""
+CAPS_JOINT_VEL_STD = 0.1
 """CAPS 공간 외란: actor joint_vel 칸(rad/s, 정규화 전). 2026-09-29 실기 분석에서 CAPS 로 gyro 민감도가
 1/25 로 줄자 joint_vel 이 남은 주 되먹임 경로였다(칸당·정규화 1 std 당 민감도가 gyro 의 약 2.6배).
 학습 정규화 std 평균 0.60 이라 0.3 은 약 0.5 std -- gyro(0.3 = 약 1 std)보다 약하게 흔든다."""
@@ -1915,8 +2098,12 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     smooth_cfg={
       "spatial_coef": CAPS_SPATIAL_COEF,
       "temporal_coef": CAPS_TEMPORAL_COEF,
-      # actor 관측 칸: base_ang_vel 0:3, joint_vel 31:56 (관측 순서를 바꾸면 같이 바꿀 것)
-      "slices": [(0, 3, CAPS_GYRO_STD), (31, 56, CAPS_JOINT_VEL_STD)],
+      # actor 관측 칸: base_ang_vel 0:3, joint_pos 6:31, joint_vel 31:56 (관측 순서를 바꾸면 같이 바꿀 것)
+      "slices": [
+        (0, 3, CAPS_GYRO_STD),
+        (6, 31, CAPS_JOINT_POS_STD),
+        (31, 56, CAPS_JOINT_VEL_STD),
+      ],
     },
     symmetry_cfg={
       "use_data_augmentation": True,
