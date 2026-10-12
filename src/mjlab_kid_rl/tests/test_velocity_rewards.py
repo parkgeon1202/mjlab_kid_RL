@@ -7,6 +7,9 @@ import unittest
 import torch
 
 from mjlab_kid_rl.tasks.mdp import (
+  same_foot_repeat_penalty,
+  base_height_exp,
+  action_target_limit_excess_l2,
   airborne_foot_arm_swing_reward,
   default_joint_pose_exp,
   feet_air_time_continuous_reward,
@@ -324,6 +327,123 @@ class TestFeetDistancePenalty(unittest.TestCase):
 
   def test_above_maximum_is_penalized_by_excess_only(self) -> None:
     torch.testing.assert_close(self._penalty(0.22), torch.tensor([0.02]))
+
+
+class TestSameFootRepeatMinAirTime(unittest.TestCase):
+  """Landings are fed one control step at a time as (foot index, air time)."""
+
+  def _run(self, landings: list[tuple[int, float]], min_air_time: float) -> list[float]:
+    state = {}
+    sensor = types.SimpleNamespace(
+      compute_first_contact=lambda dt: state["landed"],
+      data=types.SimpleNamespace(last_air_time=None),
+    )
+    env = types.SimpleNamespace(
+      num_envs=1,
+      device=torch.device("cpu"),
+      step_dt=0.02,
+      scene={"feet": sensor},
+      command_manager=types.SimpleNamespace(
+        get_command=lambda _: torch.tensor([[0.3, 0.0, 0.0]])
+      ),
+    )
+    term = same_foot_repeat_penalty(types.SimpleNamespace(params={}), env)
+    out = []
+    for foot, air_time in landings:
+      landed = torch.zeros(1, 2, dtype=torch.bool)
+      landed[0, foot] = True
+      state["landed"] = landed
+      last = torch.zeros(1, 2)
+      last[0, foot] = air_time
+      sensor.data.last_air_time = last
+      out.append(float(term(env, "feet", "twist", 0.01, min_air_time)[0]))
+    return out
+
+  def test_real_repeat_is_still_penalized(self) -> None:
+    self.assertEqual(self._run([(0, 0.3), (0, 0.3)], 0.04), [0.0, 1.0])
+
+  def test_flicker_is_neither_penalized_nor_remembered(self) -> None:
+    # Left steps, left flickers (one control step), right steps, right flickers,
+    # left steps: a clean alternation once the flickers are ignored.
+    self.assertEqual(
+      self._run([(0, 0.3), (0, 0.02), (1, 0.3), (1, 0.02), (0, 0.3)], 0.04),
+      [0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+
+  def test_two_control_steps_in_the_air_counts(self) -> None:
+    self.assertEqual(self._run([(0, 0.3), (0, 0.04)], 0.04), [0.0, 1.0])
+
+  def test_without_threshold_flicker_is_penalized_as_before(self) -> None:
+    self.assertEqual(self._run([(0, 0.3), (0, 0.02)], 0.0), [0.0, 1.0])
+
+
+class TestBaseHeightExp(unittest.TestCase):
+  def _reward(self, heights: list[float]) -> torch.Tensor:
+    pos = torch.zeros(len(heights), 3)
+    pos[:, 2] = torch.tensor(heights)
+    env = types.SimpleNamespace(
+      scene={"robot": types.SimpleNamespace(
+        data=types.SimpleNamespace(root_link_pos_w=pos)
+      )}
+    )
+    return base_height_exp(env, target_height=0.413, std=0.02)
+
+  def test_is_one_at_target_and_symmetric_around_it(self) -> None:
+    reward = self._reward([0.413, 0.393, 0.433])
+    torch.testing.assert_close(
+      reward, torch.tensor([1.0, math.exp(-1.0), math.exp(-1.0)])
+    )
+
+  def test_far_below_target_pays_almost_nothing(self) -> None:
+    self.assertLess(float(self._reward([0.353])[0]), 1e-3)
+
+
+class TestActionTargetLimitExcessL2(unittest.TestCase):
+  def _penalty(
+    self, raw_action: torch.Tensor, joint_names: tuple[str, ...] | None = None
+  ) -> torch.Tensor:
+    # Three action joints mapped onto asset joints 2, 0, 1.
+    soft_limits = torch.tensor([[[-1.0, 1.0], [-0.5, 2.0], [-0.9, 0.9]]])
+    action_term = types.SimpleNamespace(
+      target_names=["left_ankle_pitch", "left_elbow_pitch", "left_knee_pitch"],
+      raw_action=raw_action,
+      scale=0.5,
+      offset=torch.tensor([[0.0, 0.2, -0.4]]),
+      target_ids=torch.tensor([2, 0, 1]),
+    )
+    env = types.SimpleNamespace(
+      device=torch.device("cpu"),
+      scene={"robot": types.SimpleNamespace(
+        data=types.SimpleNamespace(soft_joint_pos_limits=soft_limits)
+      )},
+      action_manager=types.SimpleNamespace(get_term=lambda _: action_term),
+    )
+    cfg = types.SimpleNamespace(
+      params={"action_name": "joint_pos", "joint_names": joint_names}
+    )
+    return action_target_limit_excess_l2(cfg, env)(env, "joint_pos", joint_names)
+
+  def test_targets_inside_limits_are_free(self) -> None:
+    # Targets 0.9, 1.0, -0.5 sit on or inside limits (-0.9..0.9, -1..1, -0.5..2).
+    torch.testing.assert_close(
+      self._penalty(torch.tensor([[1.8, 1.6, -0.2]])), torch.zeros(1)
+    )
+
+  def test_charges_each_joint_against_its_own_limit(self) -> None:
+    # Targets 1.4, -1.3, 3.1 -> 0.5 over, 0.3 under, 1.1 over.
+    torch.testing.assert_close(
+      self._penalty(torch.tensor([[2.8, -3.0, 7.0]])),
+      torch.tensor([0.5**2 + 0.3**2 + 1.1**2]),
+    )
+
+  def test_joint_names_leave_other_joints_uncharged(self) -> None:
+    # Same targets; the elbow (0.3 under) is not selected.
+    torch.testing.assert_close(
+      self._penalty(
+        torch.tensor([[2.8, -3.0, 7.0]]), (r".*_(ankle|knee)_pitch",)
+      ),
+      torch.tensor([0.5**2 + 1.1**2]),
+    )
 
 
 class TestSelectedActionExcessL2(unittest.TestCase):

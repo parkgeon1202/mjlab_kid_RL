@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import re
 import math
 from dataclasses import dataclass
 
@@ -15,6 +17,7 @@ import torch
 from mjlab.entity import Entity
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
+from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
@@ -660,6 +663,28 @@ def relative_linear_velocity_error_penalty(
     return torch.square(relative_error) * active.float()
 
 
+def track_yaw_velocity_exp(
+    env: ManagerBasedRlEnv,
+    std: float,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward tracking of the commanded yaw rate only: exp(-(wz_cmd - wz)^2 / std^2).
+
+    mjlab's ``track_angular_velocity`` adds the base roll and pitch rates to the
+    error, so any stepping -- which always rocks the base a little -- loses part
+    of this reward, while standing still keeps that part. With its wide kernel
+    (std^2 = 0.2) a robot that ignored a 0.3 rad/s turn command by standing kept
+    64% of the reward, and the 2026-10-11 policy did not turn at all in sim.
+    Roll and pitch rates are already charged by ``body_ang_vel``.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    yaw_error = torch.square(command[:, 2] - asset.data.root_link_ang_vel_b[:, 2])
+    return torch.exp(-yaw_error / std**2)
+
+
 def relative_angular_velocity_error_penalty(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -886,6 +911,11 @@ class same_foot_repeat_penalty:
         command_name: Velocity command to gate on. A standing robot should not
             be stepping at all, which is no_stepping's job, not this term's.
         command_threshold: Below this commanded speed the term is switched off.
+        min_air_time: Landings after less than this long in the air are not
+            steps and are ignored: they are neither penalized nor remembered
+            as the last foot. A stance foot sliding on a slippery floor loses
+            contact for a control step or two and "lands" again; counting
+            those charged the slip, not the gait.
     """
 
     _NONE = -1  # no foot has landed yet this episode
@@ -906,9 +936,20 @@ class same_foot_repeat_penalty:
         sensor_name: str,
         command_name: str = "twist",
         command_threshold: float = 0.05,
+        min_air_time: float = 0.0,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_landed = sensor.compute_first_contact(dt=env.step_dt)  # [B, F] bool
+        if min_air_time > 0.0:
+            last_air_time = sensor.data.last_air_time
+            assert last_air_time is not None, (
+                f"Sensor '{sensor_name}' needs track_air_time=True"
+            )
+            # Half a control step of slack: air times are multiples of step_dt
+            # stored in float32, and a swing of exactly min_air_time must count.
+            just_landed = just_landed & (
+                last_air_time >= min_air_time - 0.5 * env.step_dt
+            )
 
         landed_count = just_landed.sum(dim=-1)  # [B]
         single = landed_count == 1
@@ -1665,6 +1706,130 @@ def randomize_bam_kp(
         b.default_kp_scale[ids] = k
 
 
+def randomize_bam_friction(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    scale_range: tuple[float, float],
+) -> None:
+    """Per-env, per-joint scale on the BAM friction budget of every actuated joint.
+
+    BAM turns its identified friction model (Coulomb + Stribeck + load-dependent
+    terms) into a per-step ``dof_frictionloss``. This multiplies that budget, so a
+    scale of 2 is a joint that needs twice the torque to break away and to keep
+    moving. Viscous damping is left alone. Each joint of each env draws its own
+    scale once, log-uniformly, so the range is covered evenly in ratio.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    bams = _bam_actuators(asset)
+    if not bams:
+        raise RuntimeError("randomize_bam_friction: no BamActuator found")
+    ids = slice(None) if env_ids is None else env_ids
+    n = env.num_envs if env_ids is None else len(env_ids)
+    lo, hi = math.log(scale_range[0]), math.log(scale_range[1])
+    for b in bams:
+        num_joints = len(b._target_ids_list)
+        if getattr(b, "_kid_friction_scale", None) is None:
+            b._kid_friction_scale = torch.ones(env.num_envs, num_joints, device=env.device)
+            inner = b._compute_friction_budget
+
+            def budget(*args, _b=b, _inner=inner, **kwargs):
+                return _inner(*args, **kwargs) * _b._kid_friction_scale
+
+            b._compute_friction_budget = budget
+        b._kid_friction_scale[ids] = torch.exp(
+            torch.empty(n, num_joints, device=env.device).uniform_(lo, hi)
+        )
+
+
+def randomize_joint_backlash(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    halfwidth_range: tuple[float, float],
+) -> None:
+    """Per-env, per-joint gear backlash for every BAM actuator, as a dead zone on position error.
+
+    The firmware P-controller sees ``target - pos``. Inside ``+/-halfwidth`` of the
+    target that error is treated as zero, so the motor pushes neither way and the
+    joint is free to move under load; outside it the error is reduced by the half
+    width. Total free play is therefore twice the half width. This is the dead-zone
+    backlash model used for Cassie (Li et al., "Reinforcement Learning for Versatile,
+    Dynamic, and Robust Bipedal Locomotion Control"): it has no hysteresis state, and
+    it adds up to one half width of static droop under a steady load.
+
+    Each joint of each env draws its own half width once. The dead zone sits inside
+    the BAM actuator, after its command delay, so it compares the delayed target
+    with the current position.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    bams = _bam_actuators(asset)
+    if not bams:
+        raise RuntimeError("randomize_joint_backlash: no BamActuator found")
+    ids = slice(None) if env_ids is None else env_ids
+    n = env.num_envs if env_ids is None else len(env_ids)
+    for b in bams:
+        num_joints = len(b._target_ids_list)
+        if getattr(b, "_kid_backlash", None) is None:
+            b._kid_backlash = torch.zeros(env.num_envs, num_joints, device=env.device)
+            inner = b.compute
+
+            def compute(cmd, _b=b, _inner=inner):
+                error = cmd.position_target - cmd.pos
+                dead = torch.sign(error) * torch.clamp(error.abs() - _b._kid_backlash, min=0.0)
+                return _inner(dataclasses.replace(cmd, position_target=cmd.pos + dead))
+
+            b.compute = compute
+        b._kid_backlash[ids] = torch.empty(n, num_joints, device=env.device).uniform_(*halfwidth_range)
+
+
+@requires_model_fields("geom_solref")
+def randomize_contact_solref(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    timeconst_range: tuple[float, float],
+    dampratio_range: tuple[float, float],
+    per_geom_dampratio: bool = False,
+    min_product: float = 0.0,
+) -> None:
+    """Per-env contact stiffness/damping (MuJoCo ``solref``) for the matched geoms.
+
+    One time constant is drawn per env and written to every matched geom, so all
+    studs of one robot stand on equally hard ground. The damping ratio is drawn
+    once per env too, or independently for every geom when ``per_geom_dampratio``
+    is set (each stud then rings differently). MuJoCo treats a contact
+    as a spring-damper with ``k = 1 / (timeconst * dampratio)^2`` and
+    ``b = 2 / timeconst`` (for full impedance): a shorter time constant is a harder
+    floor, and a damping ratio below 1 lets the foot ring after touchdown at about
+    ``1 / (2 * pi * timeconst * dampratio)`` Hz instead of settling dead.
+
+    ``min_product`` raises the damping ratio wherever ``timeconst * dampratio``
+    would fall below it. That product sets the ringing frequency, and a contact
+    that rings too fast for the physics step does not ring -- it chatters and
+    throws the robot (10 ms / 0.3 = 53 Hz at a 5 ms step fell within 0.3 s, while
+    15 ms / 0.3, 12 ms / 0.4 and 10 ms / 0.5 all walked for 90 s+).
+
+    The time constant cannot go below two physics steps; MuJoCo clamps it there.
+    The geoms must win the contact (higher ``priority`` than the terrain) for
+    their solref to be the one used -- the foot geoms do.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    geom_ids = asset.indexing.geom_ids[asset_cfg.geom_ids]
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = len(env_ids)
+    num_geoms = len(geom_ids)
+    solref = torch.empty(n, num_geoms, 2, device=env.device)
+    solref[..., 0] = torch.empty(n, 1, device=env.device).uniform_(*timeconst_range)
+    damp_shape = (n, num_geoms) if per_geom_dampratio else (n, 1)
+    solref[..., 1] = torch.empty(damp_shape, device=env.device).uniform_(*dampratio_range)
+    if min_product > 0.0:
+        solref[..., 1] = torch.maximum(solref[..., 1], min_product / solref[..., 0])
+    env_grid, geom_grid = torch.meshgrid(env_ids.long(), geom_ids.long(), indexing="ij")
+    env.sim.model.geom_solref[env_grid, geom_grid] = solref
+
+
 class imu_gyro_lowpass:
     """IMU angular velocity through the same 1st-order low-pass as the real controller.
 
@@ -2307,6 +2472,27 @@ def base_height_penalty(
     return torch.clamp(minimum_height - height, min=0.0)
 
 
+def base_height_exp(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    std: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward the base for sitting at the height it has in the default pose.
+
+    ``exp(-(height - target_height)^2 / std^2)``: 1 at the target, falling off
+    on both sides, so crouching and rising onto straight legs both lose it.
+    With std = 0.02 m the reward is 0.78 at 1 cm off, 0.37 at 2 cm, 0.11 at
+    3 cm and 0.02 at 4 cm -- beyond about 4 cm it is flat and no longer pulls,
+    which is what base_height_penalty's linear floor is for.
+
+    Height is the root link's world z, so this assumes flat ground.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    error = asset.data.root_link_pos_w[:, 2] - target_height
+    return torch.exp(-torch.square(error) / std**2)
+
+
 class selected_action_excess_l2:
     """Penalize selected raw actions only beyond a magnitude threshold."""
 
@@ -2338,6 +2524,66 @@ class selected_action_excess_l2:
         selected = raw_action[:, self.action_ids]
         excess = torch.clamp(torch.abs(selected) - max_abs_action, min=0.0)
         return torch.sum(torch.square(excess), dim=1)
+
+
+class action_target_limit_excess_l2:
+    """Penalize joint position targets that lie outside the joint's soft limits.
+
+    The target a position action asks for is ``offset + scale * action`` (the
+    offset is the default pose). Once that passes the joint limit, a larger
+    action moves nothing -- the joint is already at its stop -- so the policy
+    can grow the action without bound at no cost, and it then sees that huge
+    value back as its own previous action. Each joint reaches its limit at a
+    different action value (an ankle pitch near 2, a hip pitch near 4), so the
+    threshold here is each joint's own soft limit rather than one action
+    magnitude for all joints.
+
+    ``joint_names`` (regexes, full match) restricts the term to some of the
+    action's joints; None means all of them. Leave out joints whose default
+    pose sits next to a limit: the folded elbows and the wrists have only
+    0.1 action units of room on one side, so ordinary exploration noise puts
+    their targets past the limit on about half of all steps and the term then
+    charges the noise, not the behaviour.
+
+    Uses the target before any per-joint action clip, so a clipped joint is
+    still charged for what the policy asked for.
+
+    Returns the sum over the selected joints of (rad beyond the limit)^2; use
+    with a negative weight.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        term = env.action_manager.get_term(cfg.params["action_name"])
+        names = list(term.target_names)
+        patterns = cfg.params.get("joint_names")
+        if patterns is None:
+            selected = list(range(len(names)))
+        else:
+            selected = [
+                i for i, name in enumerate(names)
+                if any(re.fullmatch(pattern, name) for pattern in patterns)
+            ]
+            if not selected:
+                raise ValueError(
+                    f"action_target_limit_excess_l2: joint_names {patterns} match no action joint"
+                )
+        self.action_ids = torch.tensor(selected, dtype=torch.long, device=env.device)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        action_name: str,
+        joint_names: tuple[str, ...] | None = None,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    ) -> torch.Tensor:
+        del joint_names  # Resolved once in __init__.
+        asset: Entity = env.scene[asset_cfg.name]
+        term = env.action_manager.get_term(action_name)
+        target = (term.raw_action * term.scale + term.offset)[:, self.action_ids]
+        limits = asset.data.soft_joint_pos_limits[:, term.target_ids[self.action_ids]]
+        below = torch.clamp(limits[..., 0] - target, min=0.0)
+        above = torch.clamp(target - limits[..., 1], min=0.0)
+        return torch.sum(torch.square(below + above), dim=1)
 
 
 class upper_body_excursion_penalty:
