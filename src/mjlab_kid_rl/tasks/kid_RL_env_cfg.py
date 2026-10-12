@@ -508,7 +508,7 @@ x3 은 기본 자세에서 출발해도 0% 였다. 바닥 마찰(0.3~2.5)과는 
 마찰은 재지 못했다. 땅 위 로그에서 "관절이 안 움직이는 동안 목표 오차가 얼마나 변했나"를 실기와 sim 으로 비교해도
 차이가 없었다(p90 0.18~0.32 대 0.16~0.52 rad). 실기 마찰이 크다는 근거가 없어 꺼 둔다. 켜려면 (0.7, 2.5)."""
 
-JOINT_BACKLASH_HALFWIDTH_RAD: tuple[float, float] | None = (0.0, 0.01)
+JOINT_BACKLASH_HALFWIDTH_RAD: tuple[float, float] | None = (0.0, 0.03)
 """관절 유격의 반폭 범위 [rad]. 환경마다, 관절마다 따로 뽑는다. None 이면 끈다.
 
 목표에서 +-반폭 안에서는 모터가 힘을 내지 않아 관절이 하중에 따라 자유롭게 움직인다(전체 유격 = 반폭의 2 배).
@@ -1173,7 +1173,7 @@ def make_kid_rl_velocity_env_cfg(
   # while a foot tilted by 15 degrees or more receives the smaller -1 penalty.
   cfg.rewards["foot_slip"].weight = -1.0
   cfg.rewards["action_rate_l2"].func = envs_mdp.action_rate_l2
-  cfg.rewards["action_rate_l2"].weight = -0.05
+  cfg.rewards["action_rate_l2"].weight = -0.01
   cfg.rewards["action_rate_l2"].params = {}
 
   cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -1554,7 +1554,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.0,
+    weight=-0.05,
     params={},
   )
   # Charge every joint for asking for a target beyond its own soft limit (rad^2
@@ -2016,6 +2016,14 @@ def make_kid_rl_velocity_env_cfg(
 # under-sized here. Revisit empirically (via ablation) if training is slow/unstable,
 # not by recomputing from observation size.
 # CAPS coefficients are starting values, not validated real-robot tuning.
+CAPS_HIGHPASS_COEF = 0.1
+"""5 Hz 위 떨림만 벌하는 손실의 계수. 0 이면 끈다.
+
+연속한 21 틱(0.42 초)의 정책 평균 action 에 고역통과 필터(CAPS_HIGHPASS_HZ)를 걸고 그 출력의 제곱을 벌한다
+(smooth_ppo.py highpass_kernel). 5 Hz 일 때 전력 이득은 1.5 Hz 이하 0.00, 2 Hz 0.01, 3 Hz 0.08, 4 Hz 0.25,
+5 Hz 0.50, 6 Hz 0.75, 8 Hz 이상 0.99. 공간 항(크기만 보고 주파수는 안 봄)과 시간 항(인접 두 틱 차이라
+경계가 없음)을 대신할 용도다. 2026-10-12: 6 Hz / 0 으로 만들었다가 4 Hz / 0.1, 이어서 5 Hz / 0.1 로 바꿨다."""
+CAPS_HIGHPASS_HZ = 5.0
 CAPS_SPATIAL_COEF = 0.0
 CAPS_TEMPORAL_COEF = 0.0
 """2026-10-12: CAPS 를 완전히 끈다(이전 0.1 / 0.03). 둘 다 0 이면 SmoothPPO 는 평활화 손실 없이 PPO 에
@@ -2098,6 +2106,10 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
     smooth_cfg={
       "spatial_coef": CAPS_SPATIAL_COEF,
       "temporal_coef": CAPS_TEMPORAL_COEF,
+      "highpass_coef": CAPS_HIGHPASS_COEF,
+      "highpass_hz": CAPS_HIGHPASS_HZ,
+      "highpass_taps": 21,
+      "control_hz": 50.0,
       # actor 관측 칸: base_ang_vel 0:3, joint_pos 6:31, joint_vel 31:56 (관측 순서를 바꾸면 같이 바꿀 것)
       "slices": [
         (0, 3, CAPS_GYRO_STD),
