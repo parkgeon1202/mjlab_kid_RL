@@ -21,8 +21,8 @@
     contact excludes, sensors, motor default classes -- is the export verbatim.
     Upper-body collision is intentionally the CAD mesh, not primitive proxies.
 
-    kid_RL_irc (2026-10-16): upper body replaced by the IRC man's (all joints fixed,
-      elbows 90 deg forward; see the comment at torso_1). Only the 12 leg joints are actuated.
+    kid_RL_irc (2026-10-16): upper body replaced by the IRC man's link tree with no joints
+      (shoulders 30 deg and elbows 90 deg forward; see the comment at torso_1). Only the 12 leg joints are actuated.
 
     kid_RL_irc (2026-10-15): copy of kid_RL_dance.xml with the IRC feet
     ("IR C발.stl" / "IR C발오른.stl" -> assets/left_foot_irc.stl, right_foot_irc.stl).
@@ -116,33 +116,62 @@
       <inertial pos="-0.014660122981346294 -2.252153885718999e-05 -0.026584967577509402" mass="0.5611" fullinertia="0.00157 0.000343 0.001655 -1e-06 9e-06 0.0" />
       <site name="imu" pos="-0.017 0 -0.0496" />
       <geom group="1" name="base_link_self_collision_1" size="0.028005 0.039405 0.079525" pos="-0.01485 -7e-05 -0.02526" quat="-0.499319 0.499297 -0.500705 -0.500677" type="box" rgba="0.7 0.7 0.7 1" />
-      <!-- IRC upper body (irc_man_description, 10/15 export), every joint fixed: torso, head (eye_1 +
-           lense_1), both arms, left gripper (ee_link_1). The export shares the kid base_link frame
-           (its torso overlays kid's torso to within 0.1 mm of translation), so it is placed with no
-           offset. Elbows are folded 90 deg forward (kid's elbow sign convention, axes from the
-           7/21 export). All links are one body: the inertial below is the composite of the 11 URDF
-           links (2.3400 kg), and geoms in one body never collide with each other. -->
+      <!-- IRC upper body (irc_man_description, 10/15 export): the URDF link tree as bodies with no
+           joints (the URDF's fixed joints), so it adds no DOF -- nothing to observe or actuate.
+           The export shares the kid base_link frame (its torso overlays kid's torso to within
+           0.1 mm), so torso_1 sits at the base_link origin. Arms are posed by the fixed joints:
+           shoulder pitch 30 deg forward and elbow 90 deg forward
+           (axes from the 7/21 export, kid's sign convention). Inertials are the URDF's per link.
+           The upper-body bodies never move relative to each other, so contacts among them and
+           with base_link are excluded below. -->
+      <geom type="mesh" mesh="irc_base_link" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
       <body name="torso_1" pos="0 0 0">
-        <inertial pos="0.0185339 0.00533379 0.0522859" mass="2.34" fullinertia="0.024631 0.0142624 0.0224151 -0.00224664 0.00175482 0.00135217" />
-        <geom type="mesh" mesh="irc_base_link" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom type="mesh" mesh="irc_torso_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="torso_1_collision" type="mesh" mesh="irc_torso_1" pos="0 0 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_eye_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="eye_1_collision" type="mesh" mesh="irc_eye_1" pos="0 0 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_right_shoulder_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="right_shoulder_1_collision" type="mesh" mesh="irc_right_shoulder_1" pos="0 0 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_right_elbow_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="right_elbow_1_collision" type="mesh" mesh="irc_right_elbow_1" pos="0 0 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_right_arm_1" pos="-0.007 0 -0.0426" quat="0.707107 0 -0.707107 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="right_arm_1_collision" type="mesh" mesh="irc_right_arm_1" pos="-0.007 0 -0.0426" quat="0.707107 0 -0.707107 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_left_shoulder_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="left_shoulder_1_collision" type="mesh" mesh="irc_left_shoulder_1" pos="0 0 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_left_elbow_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="left_elbow_1_collision" type="mesh" mesh="irc_left_elbow_1" pos="0 0 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_left_arm_1" pos="-0.007 0 -0.0426" quat="0.707107 0 -0.707107 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom group="1" name="left_arm_1_collision" type="mesh" mesh="irc_left_arm_1" pos="-0.007 0 -0.0426" quat="0.707107 0 -0.707107 0" rgba="0.7 0.7 0.7 1" />
-        <geom type="mesh" mesh="irc_lense_1" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
-        <geom type="mesh" mesh="irc_ee_link_1" pos="-0.007 0 -0.0426" quat="0.707107 0 -0.707107 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+        <inertial pos="-0.00379904 -4.73075e-05 0.0711382" mass="1.53939" fullinertia="0.009537 0.005664 0.006995 2.1e-06 -0.000683 8.5e-06" />
+        <geom type="mesh" mesh="irc_torso_1" pos="0 -0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+        <geom group="1" name="torso_1_collision" type="mesh" mesh="irc_torso_1" pos="0 -0 0" rgba="0.7 0.7 0.7 1" />
+        <body name="eye_1" pos="0.0386 0.0205 0.1152">
+          <inertial pos="0.0405871 -0.0468941 0.0277086" mass="0.08412" fullinertia="7e-05 2.6e-05 8.13e-05 1.13e-05 -5.6e-06 3.4e-06" />
+          <geom type="mesh" mesh="irc_eye_1" pos="-0.0386 -0.0205 -0.1152" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+          <geom group="1" name="eye_1_collision" type="mesh" mesh="irc_eye_1" pos="-0.0386 -0.0205 -0.1152" rgba="0.7 0.7 0.7 1" />
+          <body name="lense_1" pos="0.034892 0.004 0.029383">
+            <inertial pos="0.0240001 -0.0244997 0.000796186" mass="1e-08" diaginertia="1e-12 1e-12 1e-12" />
+            <geom type="mesh" mesh="irc_lense_1" pos="-0.073492 -0.0245 -0.144583" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+          </body>
+        </body>
+        <body name="right_shoulder_1" pos="0.0178 -0.0955 0.0935" quat="0.965926 0 -0.258819 0">
+          <inertial pos="0.000504927 -0.0244726 -0.0311669" mass="0.081361" fullinertia="3.56e-05 3.45e-05 2.05e-05 0 1.1e-06 -4.3e-06" />
+          <geom type="mesh" mesh="irc_right_shoulder_1" pos="-0.0178 0.0955 -0.0935" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+          <geom group="1" name="right_shoulder_1_collision" type="mesh" mesh="irc_right_shoulder_1" pos="-0.0178 0.0955 -0.0935" rgba="0.7 0.7 0.7 1" />
+          <body name="right_elbow_1" pos="0.0205 -0.0268 -0.0488">
+            <inertial pos="-0.0205002 -0.000214187 -0.0495992" mass="0.109356" fullinertia="5.47e-05 5.91e-05 3.55e-05 -0 0 -1.5e-06" />
+            <geom type="mesh" mesh="irc_right_elbow_1" pos="-0.0383 0.1223 -0.0447" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+            <geom group="1" name="right_elbow_1_collision" type="mesh" mesh="irc_right_elbow_1" pos="-0.0383 0.1223 -0.0447" rgba="0.7 0.7 0.7 1" />
+            <body name="right_arm_1" pos="-0.0205 -0.0205 -0.0695" quat="0.707107 0 -0.707107 0">
+              <inertial pos="0.000214273 0.0205003 -0.0495992" mass="0.109356" fullinertia="5.91e-05 5.47e-05 3.55e-05 0 1.5e-06 0" />
+              <geom type="mesh" mesh="irc_right_arm_1" pos="-0.0178 0.1428 0.0248" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+              <geom group="1" name="right_arm_1_collision" type="mesh" mesh="irc_right_arm_1" pos="-0.0178 0.1428 0.0248" rgba="0.7 0.7 0.7 1" />
+            </body>
+          </body>
+        </body>
+        <body name="left_shoulder_1" pos="0.0178 0.0955 0.0935" quat="0.965926 0 -0.258819 0">
+          <inertial pos="0.000504927 0.0244732 -0.0311669" mass="0.081361" fullinertia="3.56e-05 3.45e-05 2.05e-05 -0 1.1e-06 4.3e-06" />
+          <geom type="mesh" mesh="irc_left_shoulder_1" pos="-0.0178 -0.0955 -0.0935" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+          <geom group="1" name="left_shoulder_1_collision" type="mesh" mesh="irc_left_shoulder_1" pos="-0.0178 -0.0955 -0.0935" rgba="0.7 0.7 0.7 1" />
+          <body name="left_elbow_1" pos="0.0205 0.0268 -0.0488">
+            <inertial pos="-0.0205002 0.00021481 -0.0495992" mass="0.109356" fullinertia="5.47e-05 5.91e-05 3.55e-05 -0 0 1.5e-06" />
+            <geom type="mesh" mesh="irc_left_elbow_1" pos="-0.0383 -0.1223 -0.0447" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+            <geom group="1" name="left_elbow_1_collision" type="mesh" mesh="irc_left_elbow_1" pos="-0.0383 -0.1223 -0.0447" rgba="0.7 0.7 0.7 1" />
+            <body name="left_arm_1" pos="-0.0205 0.0205 -0.0695" quat="0.707107 0 -0.707107 0">
+              <inertial pos="0.000143842 -0.0180846 -0.10765" mass="0.2257" fullinertia="0.000486 0.00046 9.28e-05 0 1.7e-06 3.71e-05" />
+              <geom type="mesh" mesh="irc_left_arm_1" pos="-0.0178 -0.1428 0.0248" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+              <geom group="1" name="left_arm_1_collision" type="mesh" mesh="irc_left_arm_1" pos="-0.0178 -0.1428 0.0248" rgba="0.7 0.7 0.7 1" />
+              <body name="ee_link_1" pos="0.0191 -0.0205 -0.18185">
+                <inertial pos="-0.0190002 3.17202e-07 -5.41111e-07" mass="1e-08" diaginertia="1e-12 1e-12 1e-12" />
+                <geom type="mesh" mesh="irc_ee_link_1" pos="-0.0369 -0.1223 0.20665" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
+              </body>
+            </body>
+          </body>
+        </body>
       </body>
       <body name="left_hip_bracket_1" pos="5e-05 0.054988 -0.0488">
         <geom type="mesh" mesh="left_hip_roll_motor_1" pos="-0.000050 -0.054988 0.048800" euler="0.000000 -0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
@@ -355,6 +384,53 @@
          with ~15deg of crank, well inside both joint ranges. -->
     <exclude body1="left_lower_leg_1" body2="left_ankle_crank_1" />
     <exclude body1="right_lower_leg_1" body2="right_ankle_crank_1" />
+    <!-- IRC upper body is rigid (no joints): its parts and base_link never move relative to each other. -->
+    <exclude body1="base_link" body2="eye_1" />
+    <exclude body1="base_link" body2="right_shoulder_1" />
+    <exclude body1="base_link" body2="right_elbow_1" />
+    <exclude body1="base_link" body2="right_arm_1" />
+    <exclude body1="base_link" body2="left_shoulder_1" />
+    <exclude body1="base_link" body2="left_elbow_1" />
+    <exclude body1="base_link" body2="left_arm_1" />
+    <exclude body1="base_link" body2="lense_1" />
+    <exclude body1="base_link" body2="ee_link_1" />
+    <exclude body1="torso_1" body2="right_elbow_1" />
+    <exclude body1="torso_1" body2="right_arm_1" />
+    <exclude body1="torso_1" body2="left_elbow_1" />
+    <exclude body1="torso_1" body2="left_arm_1" />
+    <exclude body1="torso_1" body2="lense_1" />
+    <exclude body1="torso_1" body2="ee_link_1" />
+    <exclude body1="eye_1" body2="right_shoulder_1" />
+    <exclude body1="eye_1" body2="right_elbow_1" />
+    <exclude body1="eye_1" body2="right_arm_1" />
+    <exclude body1="eye_1" body2="left_shoulder_1" />
+    <exclude body1="eye_1" body2="left_elbow_1" />
+    <exclude body1="eye_1" body2="left_arm_1" />
+    <exclude body1="eye_1" body2="ee_link_1" />
+    <exclude body1="right_shoulder_1" body2="right_arm_1" />
+    <exclude body1="right_shoulder_1" body2="left_shoulder_1" />
+    <exclude body1="right_shoulder_1" body2="left_elbow_1" />
+    <exclude body1="right_shoulder_1" body2="left_arm_1" />
+    <exclude body1="right_shoulder_1" body2="lense_1" />
+    <exclude body1="right_shoulder_1" body2="ee_link_1" />
+    <exclude body1="right_elbow_1" body2="left_shoulder_1" />
+    <exclude body1="right_elbow_1" body2="left_elbow_1" />
+    <exclude body1="right_elbow_1" body2="left_arm_1" />
+    <exclude body1="right_elbow_1" body2="lense_1" />
+    <exclude body1="right_elbow_1" body2="ee_link_1" />
+    <exclude body1="right_arm_1" body2="left_shoulder_1" />
+    <exclude body1="right_arm_1" body2="left_elbow_1" />
+    <exclude body1="right_arm_1" body2="left_arm_1" />
+    <exclude body1="right_arm_1" body2="lense_1" />
+    <exclude body1="right_arm_1" body2="ee_link_1" />
+    <exclude body1="left_shoulder_1" body2="left_arm_1" />
+    <exclude body1="left_shoulder_1" body2="lense_1" />
+    <exclude body1="left_shoulder_1" body2="ee_link_1" />
+    <exclude body1="left_elbow_1" body2="lense_1" />
+    <exclude body1="left_elbow_1" body2="ee_link_1" />
+    <exclude body1="left_arm_1" body2="lense_1" />
+    <exclude body1="lense_1" body2="ee_link_1" />
+    <!-- end IRC upper body excludes -->
   </contact>
   <tendon>
     <fixed name="left_hip_cap_couple">
