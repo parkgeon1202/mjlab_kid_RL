@@ -58,9 +58,15 @@ def get_spec() -> mujoco.MjSpec:
 # sag further under load. The hip/ankle roll "cap" and "actual" joints have no XML
 # actuator (they're coupled to the "crank" joint via a fixed tendon equality) and
 # are silently skipped.
-_VIN_RANGE = (15.8, 16.8)
-_VIN_MIN = 15.6
-_VIN_DROP_RESISTANCE_RANGE = (0.0, 0.01)
+# 2026-10-13: 실기에서 모터 Present Input Voltage 를 기록해 맞췄다(kid_rl_20261013_213042.csv).
+# 전원은 16.5 V 지만 모터 단자에서는 서 있을 때 평균 15.5 V, 걸을 때 평균 15.2 V, 순간 최저 12.8 V 였다.
+# 이전 값 (15.8, 16.8) / 15.6 / (0, 0.01) 은 강하가 거의 없다고 본 것이다.
+# 강하 저항은 같은 정책을 sim 에서 걸렸을 때의 전류(다리 pitch 그룹 평균 0.54 A, 최대 2.8 A)로 실기 강하
+# (평균 0.3 V, 최대 2.7 V)가 나오도록 잡은 유효값이다. BAM 은 모터 그룹마다 자기 전류만 보므로 배선
+# 저항 실측값이 아니다.
+_VIN_RANGE = (14.8, 15.8)
+_VIN_MIN = 12.5
+_VIN_DROP_RESISTANCE_RANGE = (0.2, 0.7)
 # Command delay, in simulation steps (0.005 s each), modeling policy->motor
 # latency. Note this constant is shared by both tasks -- the velocity task and
 # the tracking task build the same robot cfg -- so DR_WIDE moves both.
@@ -127,10 +133,13 @@ MX64V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
   target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
-  # 46 -> 25 (2026-10-05): fitted to an airborne real log (air1005.csv, firmware kp 46).
-  # Replaying the real targets open-loop, the hip yaws tracked 1.59x too far at 46;
-  # position RMS error is lowest at 0.55x. The real firmware gain stays 46.
-  kp_fw=25,
+  # 2026-10-13: 25 -> 167, 실기 펌웨어 kp 는 46 -> 150.
+  # 실기 Present PWM 을 기록해 보니 kp 46 에서 듀티가 오차 1 rad 당 0.267 이었다(KP 나눗수 127).
+  # 이 모델의 나눗수는 141.32 라 같은 듀티를 내려면 kp_fw = 실기 kp x 141.32 / 127 이다. 그동안 쓴
+  # 25(2026-10-05, 공중 로그의 위치 오차로 맞춘 값)는 실기 듀티의 절반이었다.
+  # 게인 자체도 올린다: kp 46 에서 hip yaw 는 목표의 27% 만 따라갔고 듀티가 4~8% 라 정지 마찰에 묻혀
+  # sim 과 파형이 맞지 않았다(상관 0.3~0.8, 좌우도 다름). 150 은 그 영역에서 벗어나게 하려는 값이다.
+  kp_fw=167,
   vin_range=_VIN_RANGE,
   vin_min=_VIN_MIN,
   vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,

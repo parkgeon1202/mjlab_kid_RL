@@ -70,6 +70,7 @@ from mjlab_kid_rl.tasks.mdp import (
   randomize_bam_kp,
   randomize_contact_solref,
   randomize_joint_backlash,
+  set_bam_motor_kt,
   track_yaw_velocity_exp,
   gait_phase_swing_clearance_reward,
   swing_progress_reward,
@@ -497,6 +498,16 @@ STUD_HEIGHT_OFFSET_M: float | None = 0.0015
 높이라 그 흔들림이 없다. 2026-10-12 실기는 걷는 중 몸통 roll 이 2 Hz 아래에서 sim 의 3~9 배(4 Hz 위는 같음).
 발판(*_foot_collision_1)은 스터드 바닥보다 3.5 mm 위라 1.5 mm 까지는 발판이 먼저 닿지 않는다."""
 
+XH540_KT: float | None = None
+"""다리 pitch 모터(XH540)의 kt [V/(rad/s)] 덮어쓰기. None 이면 BAM 식별값(2.65)을 그대로 쓴다.
+
+2026-10-13 실기 로그(땅 위, 폐루프)에서 같은 목표 오차에 대해 hip/knee/ankle pitch 가 움직이는 속도가 sim 의
+절반이었다(오차 0.2~0.35 rad: 실기 0.61 / sim 1.04~1.21 rad/s, 0.35~0.6 rad: 1.00~1.23 / 1.80~1.95). 같은 로그에서
+MX-106(hip roll)은 sim 과 같았다. 같은 명령을 sim 에 재생하며 kt 만 바꾸면 3.8 에서 0.77~0.90 / 1.36~1.52,
+4.6 에서 0.65~0.77 / 1.12~1.32 로 실기와 15% 안에서 맞는다. 속도는 vin / kt 에 비례하므로 실기 전원 전압이 sim
+(15.8~16.8 V)보다 낮은 것도 이 값에 같이 흡수된다 -- 실기 전압은 재지 못했다. 4.6 에서 같은 정책은 sim 에서도
+명령 속도의 절반(0.17 / 0.36 m/s)만 낸다. 모델 보정이라 랜덤화를 꺼도 적용된다."""
+
 BAM_FRICTION_SCALE_RANGE: tuple[float, float] | None = None
 """구동 관절(BAM) 마찰 배율 범위. 환경마다, 관절마다 따로 뽑는다(로그 균등). None 이면 끈다.
 
@@ -508,7 +519,7 @@ x3 은 기본 자세에서 출발해도 0% 였다. 바닥 마찰(0.3~2.5)과는 
 마찰은 재지 못했다. 땅 위 로그에서 "관절이 안 움직이는 동안 목표 오차가 얼마나 변했나"를 실기와 sim 으로 비교해도
 차이가 없었다(p90 0.18~0.32 대 0.16~0.52 rad). 실기 마찰이 크다는 근거가 없어 꺼 둔다. 켜려면 (0.7, 2.5)."""
 
-JOINT_BACKLASH_HALFWIDTH_RAD: tuple[float, float] | None = (0.0, 0.03)
+JOINT_BACKLASH_HALFWIDTH_RAD: tuple[float, float] | None = (0.0, 0.06)
 """관절 유격의 반폭 범위 [rad]. 환경마다, 관절마다 따로 뽑는다. None 이면 끈다.
 
 목표에서 +-반폭 안에서는 모터가 힘을 내지 않아 관절이 하중에 따라 자유롭게 움직인다(전체 유격 = 반폭의 2 배).
@@ -1120,12 +1131,12 @@ def make_kid_rl_velocity_env_cfg(
     func=not_stepping_penalty,
     # Charge only after one uninterrupted second of double support under
     # a walking command. Landing between steps resets the timer.
-    weight=-0.5,
+    weight=-100.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
       "command_threshold": walking_threshold,
-      "min_duration_s": 1.0,
+      "min_duration_s": 0.2,
     },
   )
   # Independently charge each foot that has not lost ground contact for 2 s
@@ -1554,7 +1565,7 @@ def make_kid_rl_velocity_env_cfg(
   )
   cfg.rewards["action_acc_l2"] = RewardTermCfg(
     func=envs_mdp.action_acc_l2,
-    weight=-0.05,
+    weight=-0.1,
     params={},
   )
   # Charge every joint for asking for a target beyond its own soft limit (rad^2
@@ -1668,12 +1679,12 @@ def make_kid_rl_velocity_env_cfg(
   # (min, max) per axis. (0.3, 0.3) pushed every env the same way every time;
   # a symmetric range is what makes the push direction random.
   cfg.events["push_robot"].params["velocity_range"] = {
-    "x": (-0.2, 0.2),
-    "y": (-0.2, 0.2),
-    "z": (-0.2, 0.2),
-    "roll": (-0.2, 0.2),
-    "pitch": (-0.2, 0.2),
-    "yaw": (-0.2, 0.2),
+    "x": (-0.3, 0.3),
+    "y": (-0.3, 0.3),
+    "z": (-0.3, 0.3),
+    "roll": (-0.3, 0.3),
+    "pitch": (-0.3, 0.3),
+    "yaw": (-0.3, 0.3),
   }
   cfg.events["push_robot"].interval_range_s = (5.0, 10.0)
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
@@ -1894,6 +1905,12 @@ def make_kid_rl_velocity_env_cfg(
         "axes": [2],
         "ranges": (-STUD_HEIGHT_OFFSET_M, STUD_HEIGHT_OFFSET_M),
       },
+    )
+  if XH540_KT is not None:
+    cfg.events["xh540_kt"] = EventTermCfg(
+      mode="startup",
+      func=set_bam_motor_kt,
+      params={"asset_cfg": SceneEntityCfg("robot"), "kt": {"xh": XH540_KT}},
     )
   if BAM_FRICTION_SCALE_RANGE is not None:
     cfg.events["bam_friction_scale"] = EventTermCfg(

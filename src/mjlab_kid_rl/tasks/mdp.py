@@ -1706,6 +1706,31 @@ def randomize_bam_kp(
         b.default_kp_scale[ids] = k
 
 
+def set_bam_motor_kt(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    kt: dict[str, float],
+) -> None:
+    """Override the BAM torque / back-EMF constant ``kt`` [V/(rad/s)] of a motor group.
+
+    ``kt`` maps a BAM actuator class-name prefix (lower case, e.g. "xh") to the
+    value. For a voltage-driven DC motor the speed reached at a given duty is
+    ``vin * duty / kt``, so a larger kt is a slower motor. This is a model
+    correction, not a randomisation: it is applied to every env and is not removed
+    when domain randomisation is switched off.
+    """
+    del env_ids
+    asset: Entity = env.scene[asset_cfg.name]
+    bams = _bam_actuators(asset)
+    for key, value in kt.items():
+        hit = [b for b in bams if type(b._bam_model.actuator).__name__.lower().startswith(key)]
+        if not hit:
+            raise RuntimeError(f"set_bam_motor_kt: no BAM actuator matches '{key}'")
+        for b in hit:
+            b._bam_model.kt.value = float(value)
+
+
 def randomize_bam_friction(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
