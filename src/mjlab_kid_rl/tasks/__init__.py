@@ -30,3 +30,14 @@ register_mjlab_task(
   rl_cfg=KID_RL_VELOCITY_RL_CFG,
   runner_cls=VelocityOnPolicyRunner,
 )
+
+# kid_RL with the IRC feet (kid_RL_irc.xml): same task on a plane. Observation and
+# action shapes are unchanged, so kid_RL checkpoints load here, but the feet sit
+# 16 mm higher in the foot frame and weigh 0.123 kg less each.
+register_mjlab_task(
+  task_id="Mjlab-Velocity-Flat-KidRL-IRC",
+  env_cfg=make_kid_rl_velocity_env_cfg(flat=True, robot="irc"),
+  play_env_cfg=make_kid_rl_velocity_env_cfg(play=True, flat=True, robot="irc"),
+  rl_cfg=KID_RL_VELOCITY_RL_CFG,
+  runner_cls=VelocityOnPolicyRunner,
+)

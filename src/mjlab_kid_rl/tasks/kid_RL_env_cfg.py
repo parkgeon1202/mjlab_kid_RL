@@ -39,6 +39,7 @@ from mjlab.viewer import ViewerConfig
 
 from mjlab_kid_rl.dr_switch import DR_WIDE
 from mjlab_kid_rl.plugins import enable_step_reward_logging
+from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_irc_constants import get_kid_rl_irc_robot_cfg
 from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_dance_constants import (
   get_kid_rl_dance_robot_cfg,
 )
@@ -579,6 +580,12 @@ lateral command) without letting the policy permanently splay the legs out
 sideways."""
 
 
+STANDING_BASE_HEIGHT = {"dance": 0.413, "irc": 0.397}
+"""Base height [m] with every joint target at HOME_KEYFRAME, per robot XML. base_height_exp
+targets it and base_height's floor sits 13 mm under it (0.40 m for "dance"). "dance" was
+measured 2026-10-11; "irc" is filled in from a measurement on the IRC feet."""
+
+
 @dataclass(kw_only=True)
 class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
   """kid_RL velocity config with CLI-switchable domain randomization."""
@@ -667,6 +674,7 @@ def make_kid_rl_velocity_env_cfg(
   play: bool = False,
   flat: bool = False,
   enable_randomization: bool = True,
+  robot: str = "dance",
 ) -> KidRLVelocityEnvCfg:
   """Velocity-tracking locomotion task for kid_RL_v3.
 
@@ -679,12 +687,19 @@ def make_kid_rl_velocity_env_cfg(
       not a drop-in swap for the generator.
     enable_randomization: Disable physics, reset, observation, and actuator
       randomization when false.
+    robot: "dance" (kid_RL_dance.xml) or "irc" (kid_RL_irc.xml, the IRC feet).
+      Only the robot entity and the base-height targets differ.
   """
+  if robot not in STANDING_BASE_HEIGHT:
+    raise ValueError(f"robot must be one of {sorted(STANDING_BASE_HEIGHT)}, got {robot!r}")
+  standing_height = STANDING_BASE_HEIGHT[robot]
   cfg = make_velocity_env_cfg()
 
   cfg.viewer = deepcopy(VIEWER_CONFIG)
   cfg.sim = deepcopy(SIM_CFG)
   cfg.scene = deepcopy(SCENE_CFG)
+  if robot == "irc":
+    cfg.scene.entities["robot"] = get_kid_rl_irc_robot_cfg()
 
   # 50 Hz policy rate. Matches the template's timestep=0.005/decimation=4 now that
   # SIM_CFG is back to 0.005 -- see the timestep comment above for why this is a
@@ -1203,7 +1218,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["base_height"] = RewardTermCfg(
     func=base_height_penalty,
     weight=-200.0,
-    params={"minimum_height": 0.40},
+    params={"minimum_height": standing_height - 0.013},
   )
 
   # Reward standing at the default pose's base height. 0.413 m is where the base
@@ -1212,7 +1227,7 @@ def make_kid_rl_velocity_env_cfg(
   cfg.rewards["base_height_exp"] = RewardTermCfg(
     func=base_height_exp,
     weight=0.1,
-    params={"target_height": 0.413, "std": 0.02},
+    params={"target_height": standing_height, "std": 0.02},
   )
 
   # A hard cap on how far the upper body may swing off HOME_KEYFRAME, covering
