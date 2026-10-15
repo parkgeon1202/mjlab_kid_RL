@@ -2192,3 +2192,28 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
   clip_actions=None,
   max_iterations=15_000,
 )
+
+
+def _irc_rl_cfg() -> RslRlOnPolicyRunnerCfg:
+  """KID_RL_VELOCITY_RL_CFG for the IRC robot (12 actuated joints, no upper body).
+
+  The SmoothPPO observation slices are laid out for the actor observation order
+  base_ang_vel(3), projected_gravity(3), joint_pos(n), joint_vel(n), actions(n),
+  command(3); with n = 12 the joint blocks move from 6:31 / 31:56 to 6:18 / 18:30.
+  Runs go to their own experiment folder so `--agent.resume` never picks up a kid
+  (25-joint) checkpoint.
+  """
+  cfg = deepcopy(KID_RL_VELOCITY_RL_CFG)
+  n = 12
+  cfg.algorithm.smooth_cfg = dict(cfg.algorithm.smooth_cfg)
+  cfg.algorithm.smooth_cfg["slices"] = [
+    (0, 3, CAPS_GYRO_STD),
+    (6, 6 + n, CAPS_JOINT_POS_STD),
+    (6 + n, 6 + 2 * n, CAPS_JOINT_VEL_STD),
+  ]
+  cfg.experiment_name = "mjlab_kid_rl_irc_velocity"
+  cfg.wandb_project = "mjlab_kid_rl_irc_velocity"
+  return cfg
+
+
+KID_RL_IRC_VELOCITY_RL_CFG = _irc_rl_cfg()

@@ -2,6 +2,7 @@ from mjlab.tasks.registry import register_mjlab_task
 from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 
 from mjlab_kid_rl.tasks.kid_RL_env_cfg import (
+  KID_RL_IRC_VELOCITY_RL_CFG,
   KID_RL_VELOCITY_RL_CFG,
   make_kid_rl_velocity_env_cfg,
 )
@@ -31,13 +32,15 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
-# kid_RL with the IRC feet (kid_RL_irc.xml): same task on a plane. Observation and
-# action shapes are unchanged, so kid_RL checkpoints load here, but the feet sit
-# 16 mm higher in the foot frame and weigh 0.123 kg less each.
+# IRC robot (kid_RL_irc.xml): kid_RL legs with the IRC feet and the IRC man's upper
+# body, same task on a plane. The upper body has no joints, so only the 12 leg
+# joints are observed and
+# actuated: kid_RL (25-joint) checkpoints do not load here. Logs go to
+# logs/rsl_rl/mjlab_kid_rl_irc_velocity.
 register_mjlab_task(
   task_id="Mjlab-Velocity-Flat-KidRL-IRC",
   env_cfg=make_kid_rl_velocity_env_cfg(flat=True, robot="irc"),
   play_env_cfg=make_kid_rl_velocity_env_cfg(play=True, flat=True, robot="irc"),
-  rl_cfg=KID_RL_VELOCITY_RL_CFG,
+  rl_cfg=KID_RL_IRC_VELOCITY_RL_CFG,
   runner_cls=VelocityOnPolicyRunner,
 )
