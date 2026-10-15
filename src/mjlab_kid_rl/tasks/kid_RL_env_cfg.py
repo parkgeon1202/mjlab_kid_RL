@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, fields
 
+import re
 import mujoco
 import numpy as np
 
@@ -668,6 +669,27 @@ class KidRLVelocityEnvCfg(ManagerBasedRlEnvCfg):
         actuator.vin_drop_resistance_range = None
         actuator.delay_min_lag = 0
         actuator.delay_max_lag = 0
+
+
+_UPPER_BODY_KEY = re.compile(r"torso_yaw|shoulder|elbow|wrist|neck|head")
+
+
+def _drop_upper_body_terms(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Remove everything that drives or scores the upper-body joints.
+
+  The IRC robot's upper body is one rigid body with no joints, so the 13 kid
+  upper-body joints these terms name do not exist there. Only the 12 leg joints
+  stay actuated; all leg terms are untouched.
+  """
+  action = cfg.actions["joint_pos"]
+  assert isinstance(action, JointPositionActionCfg)
+  action.clip = {k: v for k, v in (action.clip or {}).items() if not _UPPER_BODY_KEY.search(k)} or None
+  for key in ("std_standing", "std_walking", "std_running"):
+    stds = cfg.rewards["pose"].params[key]
+    cfg.rewards["pose"].params[key] = {k: v for k, v in stds.items() if not _UPPER_BODY_KEY.search(k)}
+  for name in ("upper_body_excursion", "arm_swing"):
+    cfg.rewards.pop(name, None)
+  cfg.events.pop("reset_upper_body_joints", None)
 
 
 def make_kid_rl_velocity_env_cfg(
@@ -2024,6 +2046,9 @@ def make_kid_rl_velocity_env_cfg(
       "y": (0.0, 0.0),
     }
     cfg.observations["actor"].enable_corruption = False
+
+  if robot == "irc":
+    _drop_upper_body_terms(cfg)
 
   # Convert last so __post_init__ applies the no-DR override after all normal,
   # flat, and play settings. Tyro also calls it after a CLI field override.
