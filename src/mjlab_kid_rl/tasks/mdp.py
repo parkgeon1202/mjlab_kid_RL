@@ -2992,7 +2992,7 @@ def self_collision_cost_excluding_linkage(
     secondary="base_link" subtree-vs-subtree sensor: any contact anywhere
     inside the robot counts, by design. That includes the hip/ankle 4-bar
     linkage's cap<->groove-wall contact (contype/conaffinity=16 in
-    kid_RL_dance.xml), which is present continuously during normal
+    kid_RL_irc.xml), which is present continuously during normal
     articulation -- session testing found found>0 on ~99% of steps the
     instant any hip/ankle roll joint moved, even with root height nominal
     the whole time (i.e. not from falling). That contact is redundant with

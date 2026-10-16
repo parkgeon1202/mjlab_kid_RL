@@ -4,7 +4,7 @@ Every randomization that has two candidate ranges reads ``DR_WIDE`` and picks on
 of them inline, so both values stay visible side by side in the config and cannot
 drift out of sync with a stale comment. The two call sites are
 ``tasks/kid_RL_env_cfg.py`` (push, base COM, observation delay, body/torso mass,
-armature, joint friction) and ``robot/kid_rl_dance/kid_rl_dance_constants.py``
+armature, joint friction) and ``robot/kid_rl_irc/kid_rl_irc_constants.py``
 (BAM motor command delay).
 
 Flip it by editing ``_DEFAULT`` below, or without touching the file at all by

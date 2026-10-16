@@ -40,10 +40,7 @@ from mjlab.viewer import ViewerConfig
 
 from mjlab_kid_rl.dr_switch import DR_WIDE
 from mjlab_kid_rl.plugins import enable_step_reward_logging
-from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_irc_constants import get_kid_rl_irc_robot_cfg
-from mjlab_kid_rl.robot.kid_rl_dance.kid_rl_dance_constants import (
-  get_kid_rl_dance_robot_cfg,
-)
+from mjlab_kid_rl.robot.kid_rl_irc.kid_rl_irc_constants import get_kid_rl_irc_robot_cfg
 from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotationCfg,
   default_joint_pose_exp,
@@ -190,7 +187,7 @@ SELF_COLLISION_SENSOR_CFG = ContactSensorCfg(
 )
 
 # One sensor per hip/ankle 4-bar linkage's cap<->groove-wall pair (contype/
-# conaffinity=16 in kid_RL_dance.xml -- a real, permanent contact during
+# conaffinity=16 in kid_RL_irc.xml -- a real, permanent contact during
 # normal articulation, redundant with the tendon equality for kinematics).
 # SELF_COLLISION_SENSOR_CFG can't exclude just these pairs itself (it's one
 # symmetric "anything in base_link touching anything in base_link" sensor,
@@ -253,9 +250,9 @@ NON_FOOT_TERRAIN_CONTACT_SENSOR_CFG = ContactSensorCfg(
 #   num_slots=1,
 # )
 
-# One frame per foot (site placed at the sole's bottom face, see kid_RL_dance.xml).
+# One frame per foot (site placed at the sole's bottom face, see kid_RL_irc.xml).
 # include_geom_groups=(0,) means "terrain only": the 52 foot/self-collision boxes
-# are tagged group=1 in kid_RL_dance.xml specifically so this doesn't also hit the
+# are tagged group=1 in kid_RL_irc.xml specifically so this doesn't also hit the
 # robot's own geoms (see FEET_GROUND_SENSOR_CFG comment above).
 _FOOT_SITE_NAMES = ("left_foot", "right_foot")
 
@@ -276,7 +273,7 @@ FOOT_HEIGHT_SCAN_CFG = TerrainHeightSensorCfg(
 # Scene.
 ##
 
-# TerrainEntityCfg's default groundplane texture already matches kid_RL_dance.xml's
+# TerrainEntityCfg's default groundplane texture already matches kid_RL_irc.xml's
 # scene.xml exactly (same checker rgb1/rgb2/markrgb), except texrepeat (mjlab
 # default is 4x4, scene.xml uses 5x5) -- override just that field. Only matters for
 # terrain_type="plane" (geom_names_expr targets the "terrain" plane geom, which
@@ -292,7 +289,7 @@ _GROUNDPLANE_MATERIAL = spec_cfg.MaterialCfg(
 
 
 def _apply_scene_xml_visuals(spec: mujoco.MjSpec) -> None:
-  """Match kid_RL_dance.xml's scene.xml sky + default camera framing.
+  """Match kid_RL_irc.xml's scene.xml sky + default camera framing.
 
   Scene always starts from mjlab's own bundled base scene.xml (headlight/haze
   already match ours by coincidence), then adds terrain/entities, then calls this
@@ -322,7 +319,7 @@ SCENE_CFG = SceneCfg(
   ),
   num_envs=1,
   extent=2.0,
-  entities={"robot": get_kid_rl_dance_robot_cfg()},
+  entities={"robot": get_kid_rl_irc_robot_cfg()},
   sensors=(FEET_GROUND_SENSOR_CFG, SELF_COLLISION_SENSOR_CFG, FOOT_HEIGHT_SCAN_CFG),
   spec_fn=_apply_scene_xml_visuals,
 )
@@ -331,7 +328,7 @@ SCENE_CFG = SceneCfg(
 # Simulation.
 ##
 
-# timestep/integrator originally matched kid_RL_dance.xml's own <option>
+# timestep/integrator originally matched kid_RL_irc.xml's own <option>
 # (0.001/implicitfast) -- Scene.compile() silently keeps mjlab's scene-level
 # defaults instead (see the "Attach conflict" warning), so this is what actually
 # makes them take effect. The hip/ankle 4-bar linkage's tendon equality +
@@ -575,16 +572,15 @@ stance."""
 _FOOT_SEPARATION_MAX = 0.5
 """Maximum allowed distance between the two foot sites [m].
 
-Hip roll joints sit ~0.11 m apart (y = +/-0.054988, see kid_RL_dance.xml), so
+Hip roll joints sit ~0.11 m apart (y = +/-0.054988, see kid_RL_irc.xml), so
 0.2 gives real room for a wider dynamic stance (turning, the +/-0.25 m/s
 lateral command) without letting the policy permanently splay the legs out
 sideways."""
 
 
-STANDING_BASE_HEIGHT = {"dance": 0.413, "irc": 0.397}
-"""Base height [m] with every joint target at HOME_KEYFRAME, per robot XML. base_height_exp
-targets it and base_height's floor sits 13 mm under it (0.40 m for "dance"). "dance" was
-measured 2026-10-11; "irc" is filled in from a measurement on the IRC feet."""
+STANDING_BASE_HEIGHT = 0.397
+"""Base height [m] with every leg joint target at HOME_KEYFRAME (measured 2026-10-16,
+flat ground). base_height_exp targets it and base_height's floor sits 13 mm under it."""
 
 
 @dataclass(kw_only=True)
@@ -696,9 +692,8 @@ def make_kid_rl_velocity_env_cfg(
   play: bool = False,
   flat: bool = False,
   enable_randomization: bool = True,
-  robot: str = "dance",
 ) -> KidRLVelocityEnvCfg:
-  """Velocity-tracking locomotion task for kid_RL_v3.
+  """Velocity-tracking locomotion task for the IRC robot (kid_RL_v3 legs, IRC feet and upper body).
 
   Starts from mjlab's stock velocity task and patches in the robot-specific
   scene, sensors, joint filters, and reward tuning.
@@ -709,19 +704,13 @@ def make_kid_rl_velocity_env_cfg(
       not a drop-in swap for the generator.
     enable_randomization: Disable physics, reset, observation, and actuator
       randomization when false.
-    robot: "dance" (kid_RL_dance.xml) or "irc" (kid_RL_irc.xml, the IRC feet).
-      Only the robot entity and the base-height targets differ.
   """
-  if robot not in STANDING_BASE_HEIGHT:
-    raise ValueError(f"robot must be one of {sorted(STANDING_BASE_HEIGHT)}, got {robot!r}")
-  standing_height = STANDING_BASE_HEIGHT[robot]
+  standing_height = STANDING_BASE_HEIGHT
   cfg = make_velocity_env_cfg()
 
   cfg.viewer = deepcopy(VIEWER_CONFIG)
   cfg.sim = deepcopy(SIM_CFG)
   cfg.scene = deepcopy(SCENE_CFG)
-  if robot == "irc":
-    cfg.scene.entities["robot"] = get_kid_rl_irc_robot_cfg()
 
   # 50 Hz policy rate. Matches the template's timestep=0.005/decimation=4 now that
   # SIM_CFG is back to 0.005 -- see the timestep comment above for why this is a
@@ -792,7 +781,7 @@ def make_kid_rl_velocity_env_cfg(
       materials=(_GROUNDPLANE_MATERIAL,),
     )
     # 2026-10-05: 192/768 -> 224/896. The feet now stand on four stud boxes each
-    # (kid_RL_dance.xml), which adds 32 contacts to the sunk-into-the-plane
+    # (kid_RL_irc.xml), which adds 32 contacts to the sunk-into-the-plane
     # configuration mujoco_warp sizes against (179 -> 211).
     cfg.sim.nconmax = 224
     cfg.sim.njmax = 896
@@ -838,7 +827,7 @@ def make_kid_rl_velocity_env_cfg(
   # 6회분(POLICY_RUNNING 17,625 틱)에서 99.13% 가 이번 틱에 읽은 값이었고, 읽기가
   # 실패해 직전 값을 재사용한 틱이 0.84%, 2스텝 이상은 0.04% 였다.
   # 실제 루프 지연(읽기 -> 정책 -> 쓰기 -> 서보 반응)은 '명령' 쪽에 있고, 그것은
-  # BAM 명령 지연(kid_rl_dance_constants.py _DELAY_*_LAG, 시뮬 스텝 5 ms 단위)이
+  # BAM 명령 지연(kid_rl_irc_constants.py _DELAY_*_LAG, 시뮬 스텝 5 ms 단위)이
   # 모사한다. 예전처럼 여기에도 min=1 을 두면 같은 지연을 두 번 세게 된다.
   # max=1 은 가끔 읽기가 실패해 한 스텝 늦은 값이 들어오는 경우에 대한 견고성이다
   # (균등 분포라 학습에서는 실기 빈도보다 훨씬 자주 나온다. 좁게 학습해 실기에서
@@ -1307,25 +1296,7 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # During straight forward motion, score both shoulder pitches against the
-  # airborne foot and still penalize the squared raw actions of the other
-  # eight arm joints, so the elbows stay folded while the shoulders swing.
-  # Otherwise penalize the squared raw actions of all ten arm joints.
-  cfg.rewards["arm_swing"] = RewardTermCfg(
-    func=airborne_foot_arm_swing_reward,
-    weight=0.5,
-    params={
-      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-      "target_angle": 0.15,
-      "std": 0.25,
-      "command_name": "twist",
-      "min_forward_command": 0.1,
-      "max_lateral_command": 0.1,
-      "max_yaw_command": 0.05,
-      "action_name": "joint_pos",
-      "asset_cfg": SceneEntityCfg("robot"),
-    },
-  )
+
 
   # Fires once, on the step an episode ends by failure. `is_terminated` reads
   # termination_manager.terminated, which excludes the time_out term, so surviving
@@ -2047,8 +2018,7 @@ def make_kid_rl_velocity_env_cfg(
     }
     cfg.observations["actor"].enable_corruption = False
 
-  if robot == "irc":
-    _drop_upper_body_terms(cfg)
+  _drop_upper_body_terms(cfg)
 
   # Convert last so __post_init__ applies the no-DR override after all normal,
   # flat, and play settings. Tyro also calls it after a CLI field override.
@@ -2195,13 +2165,12 @@ KID_RL_VELOCITY_RL_CFG = RslRlOnPolicyRunnerCfg(
 
 
 def _irc_rl_cfg() -> RslRlOnPolicyRunnerCfg:
-  """KID_RL_VELOCITY_RL_CFG for the IRC robot (12 actuated joints, no upper body).
+  """The RL config for the IRC robot (12 actuated joints, no upper body).
 
   The SmoothPPO observation slices are laid out for the actor observation order
   base_ang_vel(3), projected_gravity(3), joint_pos(n), joint_vel(n), actions(n),
   command(3); with n = 12 the joint blocks move from 6:31 / 31:56 to 6:18 / 18:30.
-  Runs go to their own experiment folder so `--agent.resume` never picks up a kid
-  (25-joint) checkpoint.
+  Runs go to their own experiment folder (mjlab_kid_rl_irc_velocity).
   """
   cfg = deepcopy(KID_RL_VELOCITY_RL_CFG)
   n = 12

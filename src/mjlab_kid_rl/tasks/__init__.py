@@ -3,44 +3,16 @@ from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 
 from mjlab_kid_rl.tasks.kid_RL_env_cfg import (
   KID_RL_IRC_VELOCITY_RL_CFG,
-  KID_RL_VELOCITY_RL_CFG,
   make_kid_rl_velocity_env_cfg,
 )
 
-# Back to the stock runner: common_step_counter now restores on resume again
-# (KidRLOnPolicyRunner in rl.py forced it to 0 to dodge the staged-curriculum
-# fast-forward-on-resume bug -- see its docstring -- at the cost of re-
-# climbing the curriculum ramp on every resume). rl.py is left in place,
-# unused, in case this needs to be swapped back.
-register_mjlab_task(
-  task_id="Mjlab-Velocity-KidRL",
-  env_cfg=make_kid_rl_velocity_env_cfg(),
-  play_env_cfg=make_kid_rl_velocity_env_cfg(play=True),
-  rl_cfg=KID_RL_VELOCITY_RL_CFG,
-  runner_cls=VelocityOnPolicyRunner,
-)
-
-# Same task with the generator terrain replaced by a plane -- for isolating gait
-# work from terrain difficulty. See make_kid_rl_velocity_env_cfg's Terrain section
-# for what the swap entails; obs/action shapes are unchanged, so checkpoints move
-# between this and Mjlab-Velocity-KidRL in either direction.
-register_mjlab_task(
-  task_id="Mjlab-Velocity-Flat-KidRL",
-  env_cfg=make_kid_rl_velocity_env_cfg(flat=True),
-  play_env_cfg=make_kid_rl_velocity_env_cfg(play=True, flat=True),
-  rl_cfg=KID_RL_VELOCITY_RL_CFG,
-  runner_cls=VelocityOnPolicyRunner,
-)
-
 # IRC robot (kid_RL_irc.xml): kid_RL legs with the IRC feet and the IRC man's upper
-# body, same task on a plane. The upper body has no joints, so only the 12 leg
-# joints are observed and
-# actuated: kid_RL (25-joint) checkpoints do not load here. Logs go to
-# logs/rsl_rl/mjlab_kid_rl_irc_velocity.
+# body, velocity tracking on a plane. The upper body has no joints, so only the 12
+# leg joints are observed and actuated. Logs go to logs/rsl_rl/mjlab_kid_rl_irc_velocity.
 register_mjlab_task(
   task_id="Mjlab-Velocity-Flat-KidRL-IRC",
-  env_cfg=make_kid_rl_velocity_env_cfg(flat=True, robot="irc"),
-  play_env_cfg=make_kid_rl_velocity_env_cfg(play=True, flat=True, robot="irc"),
+  env_cfg=make_kid_rl_velocity_env_cfg(flat=True),
+  play_env_cfg=make_kid_rl_velocity_env_cfg(play=True, flat=True),
   rl_cfg=KID_RL_IRC_VELOCITY_RL_CFG,
   runner_cls=VelocityOnPolicyRunner,
 )

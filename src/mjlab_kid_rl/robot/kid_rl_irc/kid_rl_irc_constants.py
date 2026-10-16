@@ -1,22 +1,12 @@
-"""Kid_RL_v3 humanoid constants -- 4-axis-arm revision ("dance").
+"""Kid_RL legs with the IRC feet and the IRC man's upper body ("irc").
 
-Diverges from `kid_rl/kid_rl_constants.py` only where the new MJCF differs:
-
-  * Each arm gained a shoulder *yaw* and a *wrist* pitch, and a neck_yaw/
-    head_pitch pair was added: 19 -> 25 actuated joints (nq 40, njnt 34).
-  * shoulder_pitch dropped from an MX64V2 to an MX28 on the real robot, so it
-    moved between the two BamActuatorCfg groups below.
-  * The torso mounts 98 mm higher (torso_1 at z=0.0962 vs -0.0018) and the whole
-    upper body is ~0.9 kg lighter (7.216 -> 6.319 kg total).
-
-The legs, pelvis/ankle 4-bar linkages, tendons, equalities, contact excludes and
-IMU sensors are byte-identical to the old model, so everything keyed off those
-carries over unchanged.
-
-`kid_RL_dance.xml` is the CAD export with the conventions the exporter drops
-re-applied by hand (see the header comment in that file): left_/right_ joint
-naming, the two foot sites, group="1" on every collision geom, names on the
-self-collision boxes, and armature=1e-3 on the 8 passive linkage joints.
+`kid_RL_irc.xml` is the kid_RL_v3 legs, pelvis and 4-bar linkages with
+  * the IRC feet: STLs placed on the ankle-roll motor by matching its clamp plates,
+    foot body inertial = IRC foot 0.126 kg + MX-106 0.153 kg, five cylinder studs;
+  * the IRC man's upper body (irc_man_description, 10/15 export) as its URDF link
+    tree with no joints, arms posed by the fixed joints (shoulder 30 deg, elbow
+    90 deg forward).
+Only the 12 leg joints are actuated. See the XML header comment for details.
 """
 
 import math
@@ -34,12 +24,12 @@ from mjlab.utils.spec_config import CollisionCfg
 # MJCF and assets.
 ##
 
-KID_RL_DANCE_XML: Path = Path(__file__).parent / "kid_RL_dance.xml"
-assert KID_RL_DANCE_XML.exists()
+KID_RL_IRC_XML: Path = Path(__file__).parent / "kid_RL_irc.xml"
+assert KID_RL_IRC_XML.exists()
 
 
 def get_spec() -> mujoco.MjSpec:
-  return mujoco.MjSpec.from_file(str(KID_RL_DANCE_XML))
+  return mujoco.MjSpec.from_file(str(KID_RL_IRC_XML))
 
 
 ##
@@ -105,34 +95,11 @@ _PRESERVE_ROLL_LINKAGE_FRICTION = (
   "right_ankle_roll_actual",
 )
 
-# Every upper-body joint is an MX28 on this revision: the 5 arm axes per side
-# (shoulder pitch/roll/yaw, elbow, wrist) plus the 2 neck/head axes. shoulder_pitch
-# in particular moved here from MX64V2 -- the new arm uses the smaller motor, so its
-# torque ceiling drops from +/-3.0 Nm to +/-1.4 Nm.
-MX28_ACTUATOR = BamActuatorCfg(
-  motor_name="mx28",
-  model="m5",
-  target_names_expr=(
-    r"^(left|right)_(shoulder_pitch|shoulder_roll|shoulder_yaw|elbow_pitch|wrist_pitch)$",
-    r"^(neck_yaw|head_pitch)$",
-  ),
-  kp_fw=27,
-  vin_range=_VIN_RANGE,
-  vin_min=_VIN_MIN,
-  vin_drop_resistance_range=_VIN_DROP_RESISTANCE_RANGE,
-  max_current=1.84,
-  delay_min_lag=_DELAY_MIN_LAG,
-  delay_max_lag=_DELAY_MAX_LAG,
-  delay_update_period=_DELAY_UPDATE_PERIOD,
-  delay_hold_prob=_DELAY_HOLD_PROB,
-  delay_per_env_phase=_DELAY_PER_ENV_PHASE,
-)
-# Only torso_yaw and the two hip yaws are left on the MX64V2 now that
-# shoulder_pitch moved to MX28.
+# The two hip yaws. (The upper body has no joints, so there is no MX28 group.)
 MX64V2_ACTUATOR = BamActuatorCfg(
   motor_name="mx64v2",
   model="m5",
-  target_names_expr=(r"^(torso_yaw|(left|right)_hip_yaw)$",),
+  target_names_expr=(r"^(left|right)_hip_yaw$",),
   # 2026-10-13: 25 -> 167, 실기 펌웨어 kp 는 46 -> 150.
   # 실기 Present PWM 을 기록해 보니 kp 46 에서 듀티가 오차 1 rad 당 0.267 이었다(KP 나눗수 127).
   # 이 모델의 나눗수는 141.32 라 같은 듀티를 내려면 kp_fw = 실기 kp x 141.32 / 127 이다. 그동안 쓴
@@ -181,8 +148,8 @@ XH540_ACTUATOR = BamActuatorCfg(
   delay_per_env_phase=_DELAY_PER_ENV_PHASE,
 )
 
-KID_RL_DANCE_ARTICULATION = EntityArticulationInfoCfg(
-  actuators=(MX28_ACTUATOR, MX64V2_ACTUATOR, MX106V2_ACTUATOR, XH540_ACTUATOR),
+KID_RL_IRC_ARTICULATION = EntityArticulationInfoCfg(
+  actuators=(MX64V2_ACTUATOR, MX106V2_ACTUATOR, XH540_ACTUATOR),
   soft_joint_pos_limit_factor=0.9,
 )
 
@@ -190,25 +157,14 @@ KID_RL_DANCE_ARTICULATION = EntityArticulationInfoCfg(
 # Keyframe config.
 ##
 
-# All 33 joints in the "home" keyframe baked into kid_RL_dance.xml are 0.0, so the
-# dict below is the only thing that shapes the stance -- the 27 new/unlisted joints
-# (arms, neck, head) fall back to resolve_expr's default_val=0.0. We use {} rather
-# than None even when empty to avoid a mjlab bug: the joint_pos=None path
-# (mjlab/entity/entity.py) reads the keyframe's qpos straight from MuJoCo (numpy
-# float64) without casting, producing a float64 default_joint_pos that then fails to
-# write into the sim's float32 qpos buffer on reset ("Index put requires the source
-# and destination dtypes match, got Float for the destination and Double for the
-# source").
-#
-# pos MUST be set explicitly to the keyframe's root height (0.476329, from the
-# "home" keyframe's qpos[2]). InitialStateCfg.pos defaults to (0,0,0), and only
-# joint_pos is overridden below, so leaving it out spawns the robot with its root at
-# z ~= 0 + reset noise + terrain height -- i.e. face-down in the ground.
-#
-# The legs are unchanged from `kid_rl`, so this pose reproduces the same stance:
-# lowest collision extent sits at z=0.00566 with the root at 0.476329.
+# The 20 joints in kid_RL_irc.xml's "home" keyframe are all 0.0, so the dict below
+# shapes the stance. joint_pos must be a dict ({} if empty), not None: the None path
+# reads the keyframe qpos as float64 and fails to write into the float32 qpos buffer
+# on reset. pos must be set explicitly (it defaults to the origin): 0.476329 is the
+# kid_RL_v3 root height, less 16.097 mm because the IRC stud tips sit that much
+# higher in the foot frame (-0.039403 vs -0.0555).
 HOME_KEYFRAME = EntityCfg.InitialStateCfg(
-  pos=(0.0, 0.0, 0.476329),
+  pos=(0.0, 0.0, 0.476329 - 0.016097),
   joint_pos={
     "left_knee_pitch": math.radians(30),
     "right_knee_pitch": -math.radians(30),
@@ -216,13 +172,6 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
     "left_ankle_pitch": -math.radians(15),
     "right_hip_pitch": math.radians(15),
     "right_ankle_pitch": math.radians(15),
-    # Arms folded forward 130deg. The elbow axes are mirrored (left +y, right
-    # -y), so forward is negative on the left and positive on the right. The
-    # fold-side elbow limit is 140deg in kid_RL_dance.xml, and the env's
-    # soft-limit startup event keeps the soft limit 7deg inside it (133deg).
-    # The arm1/arm3 convex-hull overlap this fold causes is excluded in the XML.
-    "left_elbow_pitch": -math.radians(130),
-    "right_elbow_pitch": math.radians(130),
   },
 )
 
@@ -309,8 +258,8 @@ FULL_COLLISION = CollisionCfg(
 ##
 
 
-def get_kid_rl_dance_robot_cfg() -> EntityCfg:
-  """Get a fresh Kid_RL "dance" robot configuration instance.
+def get_kid_rl_irc_robot_cfg() -> EntityCfg:
+  """Get a fresh IRC robot configuration instance.
 
   Returns a new EntityCfg instance each time to avoid mutation issues when
   the config is shared across multiple places.
@@ -319,7 +268,7 @@ def get_kid_rl_dance_robot_cfg() -> EntityCfg:
     init_state=HOME_KEYFRAME,
     collisions=(FULL_COLLISION,),
     spec_fn=get_spec,
-    articulation=KID_RL_DANCE_ARTICULATION,
+    articulation=KID_RL_IRC_ARTICULATION,
   )
 
 
@@ -333,7 +282,7 @@ if __name__ == "__main__":
   device = "cuda:0" if torch.cuda.is_available() else "cpu"
   scene_cfg = SceneCfg(
     terrain=TerrainEntityCfg(terrain_type="plane"),
-    entities={"robot": get_kid_rl_dance_robot_cfg()},
+    entities={"robot": get_kid_rl_irc_robot_cfg()},
   )
   scene = Scene(scene_cfg, device=device)
   model = scene.compile()
