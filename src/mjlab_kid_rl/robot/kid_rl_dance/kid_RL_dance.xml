@@ -30,7 +30,7 @@
     </default>
     <default class="mx64v2">
       <joint armature="0.011729" damping="1.058645" frictionloss="0.075020" actuatorfrcrange="-3.0 3.0" />
-      <position kp="167" kv="0" forcerange="-3.0 3.0" />
+      <position kp="25" kv="0" forcerange="-3.0 3.0" />
     </default>
     <default class="mx106v2">
       <joint armature="0.026018" damping="2.472776" frictionloss="0.000000" actuatorfrcrange="-6.0 6.0" />
