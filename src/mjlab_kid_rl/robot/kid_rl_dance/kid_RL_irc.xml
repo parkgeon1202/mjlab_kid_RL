@@ -100,6 +100,7 @@
     <mesh name="irc_base_link" file="irc_base_link.stl" scale="0.001 0.001 0.001" />
     <mesh name="irc_torso_1" file="irc_torso_1.stl" scale="0.001 0.001 0.001" />
     <mesh name="irc_eye_1" file="irc_eye_1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="irc_lense_1" file="irc_lense_1.stl" scale="0.001 0.001 0.001" />
     <mesh name="irc_right_shoulder_1" file="irc_right_shoulder_1.stl" scale="0.001 0.001 0.001" />
     <mesh name="irc_right_elbow_1" file="irc_right_elbow_1.stl" scale="0.001 0.001 0.001" />
     <mesh name="irc_right_arm_1" file="irc_right_arm_1.stl" scale="0.001 0.001 0.001" />
@@ -120,7 +121,7 @@
            0.1 mm), so torso_1 sits at the base_link origin. Arms are posed by the fixed joints:
            shoulder pitch 30 deg forward and elbow 90 deg forward
            (axes from the 7/21 export, kid's sign convention). Inertials are the URDF's per link.
-           The URDF's lens (lense_1) and gripper tip (ee_link_1) placeholders are left out. The
+           The URDF's lens (lense_1) is a visual geom on eye_1 and its gripper tip (ee_link_1) is left out. The
            upper-body bodies never move relative to each other, so contacts among them and
            with base_link are excluded below. -->
       <geom type="mesh" mesh="irc_base_link" pos="0 0 0" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
@@ -132,6 +133,8 @@
           <inertial pos="0.0405871 -0.0468941 0.0277086" mass="0.08412" fullinertia="7e-05 2.6e-05 8.13e-05 1.13e-05 -5.6e-06 3.4e-06" />
           <geom type="mesh" mesh="irc_eye_1" pos="-0.0386 -0.0205 -0.1152" contype="0" conaffinity="0" group="2" rgba="0.75 0.75 0.75 1" />
           <geom group="1" name="eye_1_collision" type="mesh" mesh="irc_eye_1" pos="-0.0386 -0.0205 -0.1152" rgba="0.7 0.7 0.7 1" />
+          <!-- Camera lens (URDF lense_1 on fixed joint "lasek"): visual only, no mass or collision. -->
+          <geom type="mesh" mesh="irc_lense_1" pos="-0.0386 -0.0205 -0.1152" contype="0" conaffinity="0" group="2" rgba="0.2 0.2 0.25 1" />
         </body>
         <body name="right_shoulder_1" pos="0.0178 -0.0955 0.0935" quat="0.965926 0 -0.258819 0">
           <inertial pos="0.000504927 -0.0244726 -0.0311669" mass="0.081361" fullinertia="3.56e-05 3.45e-05 2.05e-05 0 1.1e-06 -4.3e-06" />
