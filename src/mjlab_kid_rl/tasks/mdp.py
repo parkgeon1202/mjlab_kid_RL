@@ -1499,6 +1499,91 @@ class forward_step_reward:
         ).sum(dim=-1)
 
 
+class yaw_step_reward:
+    """Reward a completed step whose foot rotation matches the yaw command.
+
+    The yaw counterpart of :class:`forward_step_reward`. At liftoff this term
+    stores the foot's world heading; at landing it compares the heading change
+    with the commanded rotation over the finished cycle:
+
+        target_yaw = yaw_command * (last_air_time + last_contact_time)
+
+    In a steady turn the stance foot holds its heading while the body keeps
+    rotating, so the swing foot must catch up a full cycle's rotation. Tapping
+    a foot down after a few degrees scores near zero against a large target,
+    which is what makes a few large turning steps pay more than many tiny ones.
+
+    The step must also rotate at least ``min_step_angle`` and lift the foot to
+    ``min_swing_height`` (both mirror forward_step_reward), so a foot pivoting
+    on the ground or barely moving under a small command does not score.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        asset: Entity = env.scene[asset_cfg.name]
+        num_feet = len(asset.find_sites(asset_cfg.site_names)[0])
+        self.liftoff_yaw = torch.zeros((env.num_envs, num_feet), device=env.device)
+        self.peak_height = torch.zeros((env.num_envs, num_feet), device=env.device)
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self.liftoff_yaw[env_ids] = 0.0
+        self.peak_height[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        height_sensor_name: str,
+        asset_cfg: SceneEntityCfg,
+        command_name: str = "twist",
+        std: float = 0.15,
+        command_threshold: float = 0.05,
+        min_step_angle: float = 0.03,
+        min_swing_height: float = 0.03,
+    ) -> torch.Tensor:
+        sensor: ContactSensor = env.scene[sensor_name]
+        just_lifted = sensor.compute_first_air(dt=env.step_dt)  # [B, F]
+        just_landed = sensor.compute_first_contact(dt=env.step_dt)  # [B, F]
+
+        asset: Entity = env.scene[asset_cfg.name]
+        foot_quat_w = asset.data.site_quat_w[:, asset_cfg.site_ids, :]  # [B, F, 4]
+        local_forward = torch.zeros_like(foot_quat_w[..., :3])
+        local_forward[..., 0] = 1.0
+        foot_forward_w = quat_apply(foot_quat_w, local_forward)  # [B, F, 3]
+        foot_yaw = torch.atan2(foot_forward_w[..., 1], foot_forward_w[..., 0])
+
+        self.liftoff_yaw = torch.where(just_lifted, foot_yaw, self.liftoff_yaw)
+        # Wrap to (-pi, pi] so a step across the +-pi seam is not a full turn.
+        delta_yaw = torch.atan2(
+            torch.sin(foot_yaw - self.liftoff_yaw),
+            torch.cos(foot_yaw - self.liftoff_yaw),
+        )
+
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        yaw_command = command[:, 2]  # [B]
+        active = (torch.abs(yaw_command) > command_threshold).unsqueeze(-1)
+
+        cycle_time = sensor.data.last_contact_time + sensor.data.last_air_time  # [B, F]
+        target_yaw = yaw_command.unsqueeze(-1) * cycle_time
+        score = torch.exp(-torch.square(delta_yaw - target_yaw) / (std**2))
+
+        height_sensor = env.scene[height_sensor_name]
+        heights = height_sensor.data.heights  # [B, F]
+        self.peak_height = torch.where(
+            just_lifted, heights, torch.maximum(self.peak_height, heights)
+        )
+        valid_step = (torch.abs(delta_yaw) >= min_step_angle) & (
+            self.peak_height >= min_swing_height
+        )
+
+        return (
+            score * just_landed.float() * valid_step.float() * active.float()
+        ).sum(dim=-1)
+
+
 def _standing_recovery_needed(
     env: ManagerBasedRlEnv,
     max_tilt: float,
@@ -2193,6 +2278,86 @@ def feet_air_time_touchdown_reward(
     speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
     is_standing = speed <= command_threshold
     return torch.where(is_standing, torch.zeros_like(walking_reward), walking_reward)
+
+
+def short_air_time_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    min_air_time: float = 0.2,
+    command_name: str | None = None,
+    yaw_min_air_time: float | None = None,
+    yaw_command_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Charge a landing that ends a swing shorter than ``min_air_time``.
+
+    With the feet set wide and a walk command, the policy can shuffle forward by
+    tapping each foot down a few control steps after lifting it -- a fast,
+    trembling gait. On the step a foot lands this returns ``min_air_time -
+    last_air_time`` for that foot when positive (seconds short of the minimum),
+    summed over feet; a swing of ``min_air_time`` or longer costs nothing, and
+    so does every step on which no foot lands. Use with a negative weight.
+
+    Not gated on the command: a foot tapping the ground under a stand command is
+    the same tremor.
+
+    With ``command_name`` and ``yaw_min_air_time`` set, envs whose |yaw command|
+    exceeds ``yaw_command_threshold`` use ``yaw_min_air_time`` instead: turning
+    is where the policy taps fastest, so it gets the longer minimum.
+    """
+    sensor: ContactSensor = env.scene[sensor_name]
+    last_air_time = sensor.data.last_air_time
+    assert last_air_time is not None, f"Sensor '{sensor_name}' needs track_air_time=True"
+    first_contact = sensor.compute_first_contact(dt=env.step_dt)
+    required = torch.full_like(last_air_time[:, 0], min_air_time)  # [B]
+    if command_name is not None and yaw_min_air_time is not None:
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        turning = torch.abs(command[:, 2]) > yaw_command_threshold
+        required = torch.where(turning, yaw_min_air_time, required)
+    shortfall = torch.clamp(required.unsqueeze(-1) - last_air_time, min=0.0)
+    return (shortfall * first_contact.float()).sum(dim=1)
+
+
+def low_swing_drag_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    height_sensor_name: str,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    max_height: float = 0.02,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Charge an airborne foot for moving horizontally close to the ground.
+
+    For each foot out of contact this returns ``foot_xy_speed * clamp(1 -
+    height / max_height, 0, 1)``, summed over feet. A foot that skims forward
+    just off the ground pays its full speed; the charge fades to zero at
+    ``max_height``, so a foot lifted first and then swung forward -- and set
+    down from above -- costs little, and the stride above ``max_height`` is
+    free. Unlike the stock feet_clearance it never charges a foot for going
+    higher. Stance-foot sliding is left to foot_slip. Use with a negative weight.
+
+    ``asset_cfg.site_names`` must select the height sensor's feet in the same
+    order.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor: ContactSensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+    if found.dim() == 3:
+        found = found.any(dim=-1)
+    in_air = ~found.bool()  # [B, F]
+
+    heights = env.scene[height_sensor_name].data.heights  # [B, F]
+    lowness = torch.clamp(1.0 - heights / max_height, min=0.0, max=1.0)
+    foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]
+    speed = torch.norm(foot_vel_xy, dim=-1)  # [B, F]
+    cost = (speed * lowness * in_air.float()).sum(dim=1)
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    total_command = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    return cost * (total_command > command_threshold).float()
 
 
 def both_feet_airborne_penalty(
@@ -3017,6 +3182,18 @@ def self_collision_cost_excluding_linkage(
         linkage_total = linkage_total + linkage_found.sum(dim=-1).float()
 
     return torch.clamp(total - linkage_total, min=0.0)
+
+
+def contact_found_penalty(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    """1 on every step the contact sensor reports any contact, else 0.
+
+    Use with a negative weight on a narrow pair sensor (e.g. left foot vs right
+    foot) whose contact should never happen.
+    """
+    sensor: ContactSensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+    return (found.reshape(found.shape[0], -1) > 0).any(dim=-1).float()
 
 
 ########################## DIAGNOSTICS #############################

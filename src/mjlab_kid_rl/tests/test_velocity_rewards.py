@@ -7,6 +7,9 @@ import unittest
 import torch
 
 from mjlab_kid_rl.tasks.mdp import (
+  short_air_time_penalty,
+  contact_found_penalty,
+  low_swing_drag_penalty,
   same_foot_repeat_penalty,
   base_height_exp,
   action_target_limit_excess_l2,
@@ -23,6 +26,7 @@ from mjlab_kid_rl.tasks.mdp import (
   flatness_weighted_foot_slip_penalty,
   foot_base_heading_error_penalty,
   forward_step_reward,
+  yaw_step_reward,
   no_stepping_penalty,
   not_stepping_penalty,
   not_stepping_each_foot_penalty,
@@ -375,6 +379,48 @@ class TestSameFootRepeatMinAirTime(unittest.TestCase):
 
   def test_without_threshold_flicker_is_penalized_as_before(self) -> None:
     self.assertEqual(self._run([(0, 0.3), (0, 0.02)], 0.0), [0.0, 1.0])
+
+
+class TestShortAirTimePenalty(unittest.TestCase):
+  def _penalty(self, landed: list[list[bool]], air: list[list[float]]) -> torch.Tensor:
+    sensor = types.SimpleNamespace(
+      compute_first_contact=lambda dt: torch.tensor(landed),
+      data=types.SimpleNamespace(last_air_time=torch.tensor(air)),
+    )
+    env = types.SimpleNamespace(step_dt=0.02, scene={"feet": sensor})
+    return short_air_time_penalty(env, "feet", min_air_time=0.2)
+
+  def test_short_landings_cost_their_shortfall(self) -> None:
+    # env 0: left taps after 0.02 s (0.18 short), right lands after 0.1 s (0.1 short)
+    torch.testing.assert_close(
+      self._penalty([[True, True]], [[0.02, 0.1]]), torch.tensor([0.28])
+    )
+
+  def test_long_swings_and_feet_not_landing_are_free(self) -> None:
+    # left lands after 0.3 s; right has a short last swing but is not landing now
+    torch.testing.assert_close(
+      self._penalty([[True, False]], [[0.3, 0.05]]), torch.tensor([0.0])
+    )
+
+  def test_yaw_command_uses_longer_minimum(self) -> None:
+    # Both envs land after 0.25 s; only env 1 is turning (0.35 s minimum).
+    sensor = types.SimpleNamespace(
+      compute_first_contact=lambda dt: torch.tensor([[True, False], [True, False]]),
+      data=types.SimpleNamespace(last_air_time=torch.tensor([[0.25, 0.0], [0.25, 0.0]])),
+    )
+    command = torch.tensor([[0.3, 0.0, 0.0], [0.0, 0.0, -0.5]])
+    env = types.SimpleNamespace(
+      step_dt=0.02,
+      scene={"feet": sensor},
+      command_manager=types.SimpleNamespace(get_command=lambda _: command),
+    )
+    torch.testing.assert_close(
+      short_air_time_penalty(
+        env, "feet", min_air_time=0.2, command_name="twist",
+        yaw_min_air_time=0.35, yaw_command_threshold=0.05,
+      ),
+      torch.tensor([0.0, 0.1]),
+    )
 
 
 class TestBaseHeightExp(unittest.TestCase):
@@ -1383,6 +1429,137 @@ class TestPlanarStepReward(unittest.TestCase):
       world_displacement_xy=(0.0, -0.15),
     )
     self.assertLess(score.item(), 1.0e-6)
+
+
+class TestYawStepReward(unittest.TestCase):
+  def _score_turning_step(
+    self,
+    yaw_command: float,
+    foot_yaw_change: float,
+    liftoff_yaw: float = 0.0,
+    peak_height: float = 0.03,
+  ) -> torch.Tensor:
+    def yaw_quat(yaw: float) -> torch.Tensor:
+      return torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
+
+    asset_cfg = types.SimpleNamespace(
+      name="robot", site_names=("left", "right"), site_ids=[0, 1]
+    )
+    site_quat_w = torch.stack((yaw_quat(liftoff_yaw), yaw_quat(0.0))).unsqueeze(0)
+    asset = types.SimpleNamespace(
+      find_sites=lambda _: ([0, 1], ["left", "right"]),
+      data=types.SimpleNamespace(site_quat_w=site_quat_w),
+    )
+    sensor = _StepSensor()
+    height_sensor = types.SimpleNamespace(
+      data=types.SimpleNamespace(heights=torch.tensor([[peak_height, 0.0]]))
+    )
+    command = torch.tensor([[0.0, 0.0, yaw_command]])
+    env = types.SimpleNamespace(
+      num_envs=1,
+      device=torch.device("cpu"),
+      step_dt=0.02,
+      scene={"robot": asset, "feet": sensor, "height": height_sensor},
+      command_manager=types.SimpleNamespace(get_command=lambda _: command),
+    )
+    term = yaw_step_reward(types.SimpleNamespace(params={"asset_cfg": asset_cfg}), env)
+
+    # Liftoff snapshots the left foot heading.
+    term(env, "feet", "height", asset_cfg)
+
+    asset.data.site_quat_w[0, 0] = yaw_quat(liftoff_yaw + foot_yaw_change)
+    sensor.first_air[:] = False
+    sensor.first_contact[0, 0] = True
+    height_sensor.data.heights[:] = 0.0
+    return term(env, "feet", "height", asset_cfg)
+
+  def test_matches_left_and_right_turns(self) -> None:
+    # _StepSensor reports a 1.0 s cycle, so the target equals the command.
+    for yaw_command in (0.5, -0.5):
+      with self.subTest(yaw_command=yaw_command):
+        torch.testing.assert_close(
+          self._score_turning_step(yaw_command, yaw_command), torch.ones(1)
+        )
+
+  def test_small_tap_scores_little_against_large_target(self) -> None:
+    score = self._score_turning_step(0.5, 0.08)
+    self.assertLess(score.item(), 1.0e-3)
+
+  def test_wraps_across_pi(self) -> None:
+    torch.testing.assert_close(
+      self._score_turning_step(0.5, 0.5, liftoff_yaw=math.pi - 0.2),
+      torch.ones(1),
+    )
+
+  def test_requires_lift_and_rotation(self) -> None:
+    torch.testing.assert_close(
+      self._score_turning_step(0.5, 0.5, peak_height=0.01), torch.zeros(1)
+    )
+    torch.testing.assert_close(
+      self._score_turning_step(0.02, 0.01), torch.zeros(1)
+    )
+
+  def test_no_yaw_command_does_not_pay(self) -> None:
+    torch.testing.assert_close(
+      self._score_turning_step(0.0, 0.3), torch.zeros(1)
+    )
+
+
+class TestLowSwingDragPenalty(unittest.TestCase):
+  def _cost(self, found, heights, speed_x, command=(0.3, 0.0, 0.0)):
+    asset_cfg = types.SimpleNamespace(name="robot", site_ids=[0, 1])
+    vel = torch.zeros((1, 2, 3))
+    vel[0, :, 0] = torch.tensor(speed_x)
+    env = types.SimpleNamespace(
+      scene={
+        "robot": types.SimpleNamespace(data=types.SimpleNamespace(site_lin_vel_w=vel)),
+        "feet": types.SimpleNamespace(
+          data=types.SimpleNamespace(found=torch.tensor([found]))
+        ),
+        "height": types.SimpleNamespace(
+          data=types.SimpleNamespace(heights=torch.tensor([heights]))
+        ),
+      },
+      command_manager=types.SimpleNamespace(
+        get_command=lambda _: torch.tensor([command])
+      ),
+    )
+    return low_swing_drag_penalty(
+      env, "feet", "height", max_height=0.02, asset_cfg=asset_cfg
+    )
+
+  def test_charges_low_airborne_foot_by_speed(self) -> None:
+    torch.testing.assert_close(
+      self._cost([0, 1], [0.0, 0.0], [0.5, 0.5]), torch.tensor([0.5])
+    )
+    torch.testing.assert_close(
+      self._cost([0, 1], [0.01, 0.0], [0.5, 0.0]), torch.tensor([0.25])
+    )
+
+  def test_free_above_max_height_and_in_contact(self) -> None:
+    torch.testing.assert_close(
+      self._cost([0, 1], [0.05, 0.0], [0.5, 0.5]), torch.zeros(1)
+    )
+    torch.testing.assert_close(
+      self._cost([1, 1], [0.0, 0.0], [0.5, 0.5]), torch.zeros(1)
+    )
+
+  def test_standing_command_does_not_charge(self) -> None:
+    torch.testing.assert_close(
+      self._cost([0, 1], [0.0, 0.0], [0.5, 0.0], command=(0.0, 0.0, 0.0)),
+      torch.zeros(1),
+    )
+
+
+class TestContactFoundPenalty(unittest.TestCase):
+  def test_one_per_env_with_any_contact(self) -> None:
+    found = torch.tensor([[[0]], [[1]], [[3]]])  # [B, primaries, slots]
+    env = types.SimpleNamespace(
+      scene={"pair": types.SimpleNamespace(data=types.SimpleNamespace(found=found))}
+    )
+    torch.testing.assert_close(
+      contact_found_penalty(env, "pair"), torch.tensor([0.0, 1.0, 1.0])
+    )
 
 
 if __name__ == "__main__":
