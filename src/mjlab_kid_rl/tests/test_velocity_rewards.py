@@ -1229,6 +1229,7 @@ class TestOneShotSwingHeightReward(unittest.TestCase):
     self.env = types.SimpleNamespace(
       num_envs=1,
       device=torch.device("cpu"),
+      step_dt=0.02,
       scene={"feet": self.contact, "height": self.height},
       command_manager=types.SimpleNamespace(get_command=lambda _: self.command),
     )
@@ -1249,6 +1250,21 @@ class TestOneShotSwingHeightReward(unittest.TestCase):
 
     self.height.data.heights[0, 1] = 0.08
     torch.testing.assert_close(self._reward(), torch.zeros(1))
+
+  def test_waits_for_min_air_time(self) -> None:
+    self.height.data.heights[0, 1] = 0.02
+    self.contact.data.current_air_time[0, 1] = 0.38
+    reward = lambda: self.term(
+      self.env,
+      sensor_name="feet",
+      height_sensor_name="height",
+      min_swing_height=0.02,
+      min_air_time=0.4,
+    )
+    torch.testing.assert_close(reward(), torch.zeros(1))
+
+    self.contact.data.current_air_time[0, 1] = 0.42
+    torch.testing.assert_close(reward(), torch.ones(1))
 
   def test_does_not_rearm_after_dropping_below_threshold_in_air(self) -> None:
     self.height.data.heights[0, 1] = 0.02
@@ -1357,6 +1373,7 @@ class TestPlanarStepReward(unittest.TestCase):
     command_xy: tuple[float, float],
     world_displacement_xy: tuple[float, float],
     root_quat_w: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+    min_air_time: float = 0.0,
   ) -> torch.Tensor:
     asset_cfg = types.SimpleNamespace(
       name="robot", site_names=("left", "right"), site_ids=[0, 1]
@@ -1389,7 +1406,7 @@ class TestPlanarStepReward(unittest.TestCase):
     sensor.first_air[:] = False
     sensor.first_contact[0, 0] = True
     height_sensor.data.heights[:] = 0.0
-    return term(env, "feet", "height", asset_cfg)
+    return term(env, "feet", "height", asset_cfg, min_air_time=min_air_time)
 
   def test_matches_forward_backward_and_lateral_commands(self) -> None:
     for command_xy, displacement_xy in (
@@ -1408,6 +1425,17 @@ class TestPlanarStepReward(unittest.TestCase):
   def test_standing_command_does_not_pay(self) -> None:
     torch.testing.assert_close(
       self._score_matching_step((0.0, 0.0), (0.1, 0.0)),
+      torch.zeros(1),
+    )
+
+  def test_requires_min_air_time(self) -> None:
+    # _StepSensor reports a 0.5 s swing.
+    torch.testing.assert_close(
+      self._score_matching_step((0.2, 0.0), (0.2, 0.0), min_air_time=0.4),
+      torch.ones(1),
+    )
+    torch.testing.assert_close(
+      self._score_matching_step((0.2, 0.0), (0.2, 0.0), min_air_time=0.6),
       torch.zeros(1),
     )
 
@@ -1438,6 +1466,7 @@ class TestYawStepReward(unittest.TestCase):
     foot_yaw_change: float,
     liftoff_yaw: float = 0.0,
     peak_height: float = 0.03,
+    min_air_time: float = 0.0,
   ) -> torch.Tensor:
     def yaw_quat(yaw: float) -> torch.Tensor:
       return torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
@@ -1471,7 +1500,7 @@ class TestYawStepReward(unittest.TestCase):
     sensor.first_air[:] = False
     sensor.first_contact[0, 0] = True
     height_sensor.data.heights[:] = 0.0
-    return term(env, "feet", "height", asset_cfg)
+    return term(env, "feet", "height", asset_cfg, min_air_time=min_air_time)
 
   def test_matches_left_and_right_turns(self) -> None:
     # _StepSensor reports a 1.0 s cycle, so the target equals the command.
@@ -1497,6 +1526,15 @@ class TestYawStepReward(unittest.TestCase):
     )
     torch.testing.assert_close(
       self._score_turning_step(0.02, 0.01), torch.zeros(1)
+    )
+
+  def test_requires_min_air_time(self) -> None:
+    # _StepSensor reports a 0.5 s swing.
+    torch.testing.assert_close(
+      self._score_turning_step(0.5, 0.5, min_air_time=0.4), torch.ones(1)
+    )
+    torch.testing.assert_close(
+      self._score_turning_step(0.5, 0.5, min_air_time=0.6), torch.zeros(1)
     )
 
   def test_no_yaw_command_does_not_pay(self) -> None:

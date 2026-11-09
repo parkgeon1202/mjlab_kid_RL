@@ -58,6 +58,10 @@ _VECTOR_TERMS = {
     # what makes the mirror consistent with a walking gait rather than with
     # both legs moving together.
     "gait_phase": (-1.0, -1.0),
+    # 11 camera frames of (visible, x, y, z) in base frame: y flips in each.
+    "hurdle_vision": (1.0, 1.0, -1.0, 1.0) * 11,
+    # (x, y, z, sin yaw, cos yaw, height, is_hurdle): y and the relative yaw flip.
+    "hurdle_truth": (1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0),
 }
 # Per-foot scalars: mirroring just swaps the two feet.
 _FOOT_SCALAR_TERMS = ("foot_height", "foot_air_time", "foot_contact")
@@ -114,21 +118,24 @@ def _build_spec(env) -> dict:
     spec: dict[str, list] = {}
     for group, names in obs_manager.active_terms.items():
         dims = obs_manager.group_obs_term_dim[group]
+        term_cfgs = obs_manager._group_obs_term_cfgs[group]
         slices = []
         offset = 0
-        for name, dim in zip(names, dims):
-            size = int(dim[0])
+        for name, dim, term_cfg in zip(names, dims, term_cfgs):
+            # A stacked term is flattened frame after frame, each frame mirrored alike.
+            frames = max(term_cfg.history_length, 1)
+            size = int(dim[0]) // frames
             stop = offset + size
 
             if name in _VECTOR_TERMS:
                 signs = _VECTOR_TERMS[name]
                 if size != len(signs):
                     raise ValueError(f"'{name}' has dim {size}, expected {len(signs)}")
-                slices.append((offset, stop, None, torch.tensor(signs, device=device)))
+                perm, signs = None, torch.tensor(signs, device=device)
             elif name in _FOOT_SCALAR_TERMS:
                 if size != 2:
                     raise ValueError(f"'{name}' has dim {size}, expected 2 (per foot)")
-                slices.append((offset, stop, [1, 0], torch.ones(2, device=device)))
+                perm, signs = [1, 0], torch.ones(2, device=device)
             elif name in _FOOT_VECTOR_TERMS:
                 if size != 6:
                     raise ValueError(f"'{name}' has dim {size}, expected 6 (2 feet x 3)")
@@ -137,20 +144,19 @@ def _build_spec(env) -> dict:
                 signs = torch.tensor(
                     _LINEAR_SIGNS + _LINEAR_SIGNS, device=device, dtype=torch.float32
                 )
-                slices.append((offset, stop, perm, signs))
             elif size in tables:
                 # joint_pos / joint_vel / actions, in whichever joint set matches.
                 perm, sign = tables[size]
-                slices.append(
-                    (offset, stop, perm, torch.tensor(sign, device=device))
-                )
+                signs = torch.tensor(sign, device=device)
             else:
                 raise ValueError(
                     f"Observation term '{name}' (group '{group}', dim {size}) has no "
                     "mirror rule. Add one to mjlab_kid_rl.tasks.symmetry before "
                     "enabling symmetry, or the mirrored batch would be wrong."
                 )
-            offset = stop
+            for frame in range(frames):
+                slices.append((offset + frame * size, stop + frame * size, perm, signs))
+            offset += frames * size
         spec[group] = slices
 
     action_perm, action_sign = tables[len(action_joints)]

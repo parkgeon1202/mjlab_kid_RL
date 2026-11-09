@@ -2,7 +2,7 @@
 
 `kid_RL_irc.xml` is the kid_RL_v3 legs, pelvis and 4-bar linkages with
   * the IRC feet: STLs placed on the ankle-roll motor by matching its clamp plates,
-    foot body inertial = IRC foot 0.126 kg + MX-106 0.153 kg, five cylinder studs;
+    foot body inertial = IRC foot 0.126 kg + MX-106 0.153 kg, five box studs (12 mm square);
   * the IRC man's upper body (irc_man_description, 10/15 export) as its URDF link
     tree with no joints, arms posed by the fixed joints (shoulder 30 deg, elbow
     90 deg forward).
@@ -215,6 +215,12 @@ _LINKAGE_PATTERN = r"^(left|right)_(hip|ankle)_(cap|groove_wall\d)$"
 # dict order is match order, first pattern wins.
 _SELF_COLLISION_PATTERN = r".*_collision"
 
+# The upper-body CAD meshes (torso, eye, shoulders, elbows, arms). Bit 1 only:
+# they still hit the terrain and the bit-1|2 leg boxes, but not the bit-2-only
+# hurdle bar (tasks/hurdle.py HURDLE_COLLISION_BITS) or the sole plates. A mesh
+# against a box goes through the GPU GJK/EPA path; this keeps the bar out of it.
+_UPPER_BODY_MESH_PATTERN = r"^(torso|eye|(left|right)_(shoulder|elbow|arm))_1_collision$"
+
 FULL_COLLISION = CollisionCfg(
   geom_names_expr=(
     _FOOT_PATTERN,
@@ -233,6 +239,7 @@ FULL_COLLISION = CollisionCfg(
     _FOOT_INNER_SAFETY_PATTERN: 32,
     _LINKAGE_PATTERN: 16,
     _FOOT_PATTERN: 3,
+    _UPPER_BODY_MESH_PATTERN: 1,
     _SELF_COLLISION_PATTERN: 3,
   },
   conaffinity={
@@ -240,6 +247,7 @@ FULL_COLLISION = CollisionCfg(
     _FOOT_INNER_SAFETY_PATTERN: 32,
     _LINKAGE_PATTERN: 16,
     _FOOT_PATTERN: 3,
+    _UPPER_BODY_MESH_PATTERN: 1,
     _SELF_COLLISION_PATTERN: 3,
   },
   condim={

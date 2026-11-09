@@ -96,6 +96,25 @@ from mjlab_kid_rl.tasks.mdp import (
   settled_standing_penalty,
 )
 from mjlab_kid_rl.tasks.mdp import upright as local_upright
+from mjlab_kid_rl.tasks.hurdle import (
+  HURDLE_BAR_BODY,
+  HURDLE_ENTITY_NAME,
+  HurdleVelocityCommandCfg,
+  OBS_HISTORY_LENGTH,
+  STACKED_TERMS,
+  hurdle_complete,
+  hurdle_contact_penalty,
+  hurdle_entity_cfg,
+  hurdle_foot_lift_reward,
+  hurdle_levels,
+  hurdle_pass_reward,
+  hurdle_scaled_body_ang_vel,
+  hurdle_scaled_upright,
+  hurdle_stride_progress_reward,
+  hurdle_truth,
+  hurdle_vision,
+  reset_root_state_hurdle,
+)
 from mjlab_kid_rl.tasks.symmetry import compute_symmetric_states
 
 ##
@@ -155,6 +174,7 @@ KID_RL_TERRAIN_GENERATOR = TerrainGeneratorCfg(
   },
 )
 
+
 ##
 # Sensors.
 ##
@@ -183,6 +203,17 @@ SELF_COLLISION_SENSOR_CFG = ContactSensorCfg(
   name="self_collision",
   primary=ContactMatch(mode="subtree", pattern="base_link", entity="robot"),
   secondary=ContactMatch(mode="subtree", pattern="base_link", entity="robot"),
+  fields=("found",),
+  reduce="none",
+  num_slots=1,
+)
+
+# Any robot collision geom (sole plates, studs, legs, upper body) touching the
+# hurdle bar entity. hurdle_contact_penalty pays for every step of it.
+HURDLE_CONTACT_SENSOR_CFG = ContactSensorCfg(
+  name="hurdle_contact",
+  primary=ContactMatch(mode="subtree", pattern="base_link", entity="robot"),
+  secondary=ContactMatch(mode="body", pattern=HURDLE_BAR_BODY, entity=HURDLE_ENTITY_NAME),
   fields=("found",),
   reduce="none",
   num_slots=1,
@@ -612,6 +643,11 @@ required by feet_crossing, forward_step, yaw_step and lateral_swing_progress.
 0.03 until 2026-11-01."""
 
 
+SWING_MIN_AIR_TIME = 0.3
+"""Air time [s] a swing must also reach to pay wherever SWING_FOOT_HEIGHT is required
+(feet_crossing, forward_step, yaw_step, lateral_swing_progress)."""
+
+
 STANDING_BASE_HEIGHT = 0.397
 """Base height [m] with every leg joint target at HOME_KEYFRAME (measured 2026-10-16,
 flat ground). base_height_exp targets it and base_height's floor sits 13 mm under it."""
@@ -1021,7 +1057,7 @@ def make_kid_rl_velocity_env_cfg(
   # The target comes from robot.data.default_joint_pos; walking is unaffected.
   cfg.rewards["default_joint_pose"] = RewardTermCfg(
     func=default_joint_pose_exp,
-    weight=3.0,
+    weight=5.0,
     params={
       "std": 0.1,
       "command_name": "twist",
@@ -1087,7 +1123,7 @@ def make_kid_rl_velocity_env_cfg(
   # continued stepping keeps it. It needs no memory of which foot stepped last.
   cfg.rewards["feet_single_contact"] = RewardTermCfg(
     func=feet_single_contact_reward,
-    weight=0.5,
+    weight=1.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1443,7 +1479,8 @@ def make_kid_rl_velocity_env_cfg(
     },
   )
 
-  # Pay once per swing when a foot first clears SWING_FOOT_HEIGHT; rearm on landing.
+  # Pay once per swing when a foot is first at SWING_FOOT_HEIGHT after SWING_MIN_AIR_TIME
+  # in the air; rearm on landing.
   # Keep the one-off bonus when the next qualifying foot is the opposite one.
   cfg.rewards["feet_crossing"] = RewardTermCfg(
     func=feet_crossing_reward,
@@ -1452,6 +1489,7 @@ def make_kid_rl_velocity_env_cfg(
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
       "min_swing_height": SWING_FOOT_HEIGHT,
+      "min_air_time": SWING_MIN_AIR_TIME,
       "alternation_bonus": 1.0,
       "command_name": "twist",
       "command_threshold": walking_threshold,
@@ -1480,6 +1518,7 @@ def make_kid_rl_velocity_env_cfg(
       "std": 0.05,
       "min_step_distance": 0.005,
       "min_swing_height": SWING_FOOT_HEIGHT,
+      "min_air_time": SWING_MIN_AIR_TIME,
     },
   )
 
@@ -1501,6 +1540,7 @@ def make_kid_rl_velocity_env_cfg(
       "std": 0.15,
       "min_step_angle": 0.03,
       "min_swing_height": SWING_FOOT_HEIGHT,
+      "min_air_time": SWING_MIN_AIR_TIME,
     },
   )
 
@@ -1508,13 +1548,14 @@ def make_kid_rl_velocity_env_cfg(
   # each step's *new* ground the swing foot gains in the commanded lateral
   # direction, past its own furthest previous landing, normalised by a target
   # step of |vy| * 0.7 s (clamped to 2..12 cm). Only the foot opposite the last
-  # landing earns it, and only while it is at least SWING_FOOT_HEIGHT up with the other foot
-  # planted -- reaching a leg out and back, or dragging a foot, pays nothing.
+  # landing earns it, and only while it is at least SWING_FOOT_HEIGHT up and SWING_MIN_AIR_TIME
+  # airborne with the other foot planted -- reaching a leg out and back, or dragging a foot,
+  # pays nothing.
   # A full target step pays weight * dt = 1.0. The base-link share of the term
   # is switched off (base_scale 0); base motion is left to velocity tracking.
   cfg.rewards["lateral_swing_progress"] = RewardTermCfg(
     func=lateral_swing_progress_reward,
-    weight=20.0,
+    weight=30.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1526,6 +1567,7 @@ def make_kid_rl_velocity_env_cfg(
       "max_target": 0.12,
       "base_scale": 0.0,
       "min_swing_height": SWING_FOOT_HEIGHT,
+      "min_air_time": SWING_MIN_AIR_TIME,
     },
   )
 
@@ -1612,7 +1654,7 @@ def make_kid_rl_velocity_env_cfg(
   # timeout resets the environment before an in-episode resample can occur.
   # Both bounds are required; ``(20.0)`` would be a float, not a one-item tuple.
   command.resampling_time_range = (1.0, 20.0)
-  command.rel_standing_envs = 0.1
+  command.rel_standing_envs = 0.2
   command.rel_heading_envs = 0.0
   command.rel_rotation_envs = 0.2
   # Exclusive fractions of all environments: standing/rotation/forward/backward
@@ -1623,7 +1665,7 @@ def make_kid_rl_velocity_env_cfg(
   # 그대로 받으므로, 이동하면서 회전하는 명령이 된다.
   command.rel_forward_only_envs = 0.2
   command.rel_backward_only_envs = 0.1
-  command.rel_lateral_only_envs = 0.2
+  command.rel_lateral_only_envs = 0.1
   command.rel_planar_only_envs = 0.1
   command.directional_min_lin_vel = 0.05
   # Use this task's explicit forward-only sampler instead of the template's
@@ -1638,7 +1680,7 @@ def make_kid_rl_velocity_env_cfg(
   command.rotation_min_ang_vel = 0.3
 
   # ---------------------------- Events ----------------------------
-  cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.01)
+  cfg.events["reset_base"].params["pose_range"]["z"] = (0.01, 0.01)
   # Sample initial base roll and pitch in either direction.
   init_tilt = float(np.deg2rad(10.0))
   cfg.events["reset_base"].params["pose_range"]["roll"] = (-init_tilt, init_tilt)
@@ -1664,12 +1706,12 @@ def make_kid_rl_velocity_env_cfg(
   # (min, max) per axis. (0.3, 0.3) pushed every env the same way every time;
   # a symmetric range is what makes the push direction random.
   cfg.events["push_robot"].params["velocity_range"] = {
-    "x": (-0.2, 0.2),
-    "y": (-0.2, 0.2),
-    "z": (-0.2, 0.2),
-    "roll": (-0.2, 0.2),
-    "pitch": (-0.2, 0.2),
-    "yaw": (-0.2, 0.2),
+    "x": (-0.1, 0.1),
+    "y": (-0.1, 0.1),
+    "z": (-0.1, 0.1),
+    "roll": (-0.1, 0.1),
+    "pitch": (-0.1, 0.1),
+    "yaw": (-0.1, 0.1),
   }
   cfg.events["push_robot"].interval_range_s = (5.0, 10.0)
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
@@ -2005,6 +2047,98 @@ def make_kid_rl_velocity_env_cfg(
   )
 
 
+def make_kid_rl_hurdle_env_cfg(play: bool = False) -> KidRLVelocityEnvCfg:
+  """The flat IRC task plus a hurdle bar ahead of 70% of the envs (tasks/hurdle.py)."""
+  cfg = make_kid_rl_velocity_env_cfg(play=play, flat=True)
+
+  cfg.scene.entities[HURDLE_ENTITY_NAME] = hurdle_entity_cfg()
+  cfg.scene.sensors = (*cfg.scene.sensors, HURDLE_CONTACT_SENSOR_CFG)
+  cfg.curriculum["hurdle_levels"] = CurriculumTermCfg(func=hurdle_levels)
+
+  base_command = cfg.commands["twist"]
+  cfg.commands["twist"] = HurdleVelocityCommandCfg(
+    **{f.name: getattr(base_command, f.name) for f in fields(base_command)}
+  )
+  cfg.events["reset_base"].func = reset_root_state_hurdle
+
+  for group in ("actor", "critic"):
+    # The last OBS_HISTORY_LENGTH frames, oldest first within each term. deepcopy:
+    # the groups can share one term object ("actions" does).
+    for term_name in STACKED_TERMS:
+      term = deepcopy(cfg.observations[group].terms[term_name])
+      term.history_length = OBS_HISTORY_LENGTH
+      cfg.observations[group].terms[term_name] = term
+  # Appended last so the SmoothPPO slices (stacked terms first) stay where they are.
+  # The actor sees the bar the way the robot's camera pipeline would report it; the
+  # critic, which never deploys, sees the true bar.
+  cfg.observations["actor"].terms["hurdle_vision"] = ObservationTermCfg(func=hurdle_vision)
+  cfg.observations["critic"].terms["hurdle_truth"] = ObservationTermCfg(func=hurdle_truth)
+
+  # RewardManager multiplies by step_dt=0.02: -20 costs 0.4 per step any robot geom
+  # touches the bar, and 500 pays 10 once for crossing it.
+  cfg.rewards["hurdle_contact"] = RewardTermCfg(
+    func=hurdle_contact_penalty,
+    weight=-200.0,
+    params={"sensor_name": HURDLE_CONTACT_SENSOR_CFG.name},
+  )
+  cfg.rewards["hurdle_pass"] = RewardTermCfg(
+    func=hurdle_pass_reward,
+    weight=1600.0,
+    params={
+      "sensor_name": HURDLE_CONTACT_SENSOR_CFG.name,
+      "asset_cfg": SceneEntityCfg("robot", site_names=tuple(_FOOT_SITE_NAMES)),
+      "command_name": "twist",
+      "command_threshold": 0.05,
+    },
+  )
+  # Step shaping near the bar (base within hurdle.HURDLE_NEAR_BAND). x step_dt:
+  # 20 pays up to 0.4 per swing for a foot rising from 2 to 6 cm (swing_progress
+  # covers 0 to 2 cm), and up to 0.4 per swing for a foot reaching 0.25 m
+  # forward, both paid gradually as the foot rises or travels.
+  feet_cfg = SceneEntityCfg("robot", site_names=tuple(_FOOT_SITE_NAMES))
+  cfg.rewards["hurdle_foot_lift"] = RewardTermCfg(
+    func=hurdle_foot_lift_reward,
+    weight=0.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+      "asset_cfg": feet_cfg,
+      "min_height": 0.02,
+      "target_height": 0.06,
+    },
+  )
+  cfg.rewards["hurdle_stride_progress"] = RewardTermCfg(
+    func=hurdle_stride_progress_reward,
+    weight=0.0,
+    params={
+      "sensor_name": FEET_GROUND_SENSOR_CFG.name,
+      "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
+      "asset_cfg": feet_cfg,
+      "min_stride": 0.05,
+      "target_stride": 0.25,
+      "min_height": 0.01,
+    },
+  )
+  # Stepping over the bar needs a long, high swing: drop the long-swing penalty.
+  cfg.rewards["overlong_swing"].weight = 0.0
+  # Roll/pitch rate costs 3x in hurdle envs (-3.0) and stays -1.0 in walking envs.
+  cfg.rewards["body_ang_vel"].func = hurdle_scaled_body_ang_vel
+  cfg.rewards["body_ang_vel"].params["hurdle_scale"] = 3.0
+  # Upright pays 3x in walking envs (3.0) and stays 1.0 in hurdle envs.
+  cfg.rewards["upright"].func = hurdle_scaled_upright
+  cfg.rewards["upright"].params["walking_scale"] = 3.0
+  # A diverged env would otherwise stop the whole run on RSL-RL's NaN check.
+  cfg.terminations["nan_term"] = TerminationTermCfg(func=envs_mdp.nan_detection)
+  # Success: hurdle.HURDLE_CONFIRM_TIME after crossing the bar, end the episode as a
+  # time-out (no failure penalty, no level drop, value bootstrapped).
+  cfg.terminations["hurdle_complete"] = TerminationTermCfg(
+    func=hurdle_complete, time_out=True
+  )
+  if play:
+    cfg.curriculum = {}
+  return cfg
+
+
 ##
 # RL algorithm (RSL-RL PPO).
 ##
@@ -2160,3 +2294,16 @@ def _irc_rl_cfg() -> RslRlOnPolicyRunnerCfg:
 
 
 KID_RL_IRC_VELOCITY_RL_CFG = _irc_rl_cfg()
+
+KID_RL_IRC_HURDLE_RL_CFG = deepcopy(KID_RL_IRC_VELOCITY_RL_CFG)
+# Every stacked frame of the three perturbed terms; see make_kid_rl_hurdle_env_cfg.
+KID_RL_IRC_HURDLE_RL_CFG.algorithm.smooth_cfg = dict(
+  KID_RL_IRC_HURDLE_RL_CFG.algorithm.smooth_cfg
+)
+KID_RL_IRC_HURDLE_RL_CFG.algorithm.smooth_cfg["slices"] = [
+  (0, 3 * OBS_HISTORY_LENGTH, CAPS_GYRO_STD),
+  (6 * OBS_HISTORY_LENGTH, 18 * OBS_HISTORY_LENGTH, CAPS_JOINT_POS_STD),
+  (18 * OBS_HISTORY_LENGTH, 30 * OBS_HISTORY_LENGTH, CAPS_JOINT_VEL_STD),
+]
+KID_RL_IRC_HURDLE_RL_CFG.experiment_name = "mjlab_kid_rl_irc_hurdle"
+KID_RL_IRC_HURDLE_RL_CFG.wandb_project = "mjlab_kid_rl_irc_hurdle"

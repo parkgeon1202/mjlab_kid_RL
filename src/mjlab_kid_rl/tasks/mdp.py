@@ -1219,8 +1219,9 @@ class lateral_swing_progress_reward:
       along that direction, scaled by ``base_scale`` (1.0 per target distance).
 
     Both count only while a foot is lifted clear -- at least ``min_swing_height``
-    above the ground with the other foot planted -- so skimming or dragging a
-    foot sideways, or sliding on both feet, earns nothing.
+    above the ground and airborne for ``min_air_time`` with the other foot
+    planted -- so skimming or dragging a foot sideways, or sliding on both feet,
+    earns nothing.
 
     Both are high-water marks: reaching a leg out and bringing it back, or
     swaying the trunk side to side, gains no new ground and so pays nothing the
@@ -1271,6 +1272,7 @@ class lateral_swing_progress_reward:
         max_target: float = 0.12,
         base_scale: float = 1.0,
         min_swing_height: float = 0.03,
+        min_air_time: float = 0.0,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         found = sensor.data.found
@@ -1320,7 +1322,11 @@ class lateral_swing_progress_reward:
         # Travel only counts while the foot is actually lifted clear: a foot
         # dragged or skimmed sideways below min_swing_height earns nothing.
         heights = env.scene[height_sensor_name].data.heights  # [B, 2]
-        lifted_clear = in_air & (heights >= min_swing_height)
+        current_air_time = sensor.data.current_air_time
+        assert current_air_time is not None
+        # Half a control step of slack, as in the alternation gate above.
+        cleared_air_time = current_air_time >= min_air_time - 0.5 * env.step_dt
+        lifted_clear = in_air & (heights >= min_swing_height) & cleared_air_time
         progress = progress * lifted_clear.float()
         previous_peak = torch.where(started, torch.zeros_like(self.peak_progress), self.peak_progress)
         current_peak = torch.where(
@@ -1422,6 +1428,7 @@ class forward_step_reward:
         command_threshold: float = 0.05,
         min_step_distance: float = 0.02,
         min_swing_height: float = 0.03,
+        min_air_time: float = 0.0,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_lifted = sensor.compute_first_air(dt=env.step_dt)  # [B, 2]
@@ -1491,8 +1498,12 @@ class forward_step_reward:
             just_lifted, heights, torch.maximum(self.peak_height, heights)
         )
         cleared_height = self.peak_height >= min_swing_height
+        # last_air_time is the swing that just ended: current_air_time is
+        # already 0 at the landing this term scores on. Half a control step of
+        # slack, as in the alternation gate above.
+        cleared_air_time = sensor.data.last_air_time >= min_air_time - 0.5 * env.step_dt
 
-        valid_step = cleared_distance & cleared_height
+        valid_step = cleared_distance & cleared_height & cleared_air_time
 
         return (
             score * just_landed.float() * valid_step.float() * active.float()
@@ -1513,9 +1524,10 @@ class yaw_step_reward:
     a foot down after a few degrees scores near zero against a large target,
     which is what makes a few large turning steps pay more than many tiny ones.
 
-    The step must also rotate at least ``min_step_angle`` and lift the foot to
-    ``min_swing_height`` (both mirror forward_step_reward), so a foot pivoting
-    on the ground or barely moving under a small command does not score.
+    The step must also rotate at least ``min_step_angle``, lift the foot to
+    ``min_swing_height`` and stay up for ``min_air_time`` (all mirror
+    forward_step_reward), so a foot pivoting on the ground or barely moving
+    under a small command does not score.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
@@ -1542,6 +1554,7 @@ class yaw_step_reward:
         command_threshold: float = 0.05,
         min_step_angle: float = 0.03,
         min_swing_height: float = 0.03,
+        min_air_time: float = 0.0,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene[sensor_name]
         just_lifted = sensor.compute_first_air(dt=env.step_dt)  # [B, F]
@@ -1575,8 +1588,10 @@ class yaw_step_reward:
         self.peak_height = torch.where(
             just_lifted, heights, torch.maximum(self.peak_height, heights)
         )
-        valid_step = (torch.abs(delta_yaw) >= min_step_angle) & (
-            self.peak_height >= min_swing_height
+        valid_step = (
+            (torch.abs(delta_yaw) >= min_step_angle)
+            & (self.peak_height >= min_swing_height)
+            & (sensor.data.last_air_time >= min_air_time - 0.5 * env.step_dt)
         )
 
         return (
@@ -3050,8 +3065,9 @@ class feet_crossing_reward:
 
     A foot is eligible only during commanded single support: exactly one foot
     is planted and the other is airborne. The airborne foot earns the base
-    reward once when it first reaches ``min_swing_height``. The next opposite
-    foot to reach the threshold earns a one-off bonus. Contact rearms that
+    reward once when it is first at ``min_swing_height`` after ``min_air_time``
+    in the air. The next opposite foot to qualify earns a one-off bonus.
+    Contact rearms that
     foot for its next swing. A swing containing sustained double flight is
     ineligible even if one foot lands first.
     """
@@ -3081,6 +3097,7 @@ class feet_crossing_reward:
         sensor_name: str,
         height_sensor_name: str,
         min_swing_height: float = 0.03,
+        min_air_time: float = 0.0,
         alternation_bonus: float = 1.0,
         command_name: str = "twist",
         command_threshold: float = 0.05,
@@ -3118,6 +3135,7 @@ class feet_crossing_reward:
         eligible = (
             ~in_contact
             & (heights >= min_swing_height)
+            & (current_air_time >= min_air_time - 0.5 * env.step_dt)
             & single_support.unsqueeze(-1)
             & ~self.invalid_this_swing
             & active.unsqueeze(-1)
