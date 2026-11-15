@@ -109,10 +109,12 @@ from mjlab_kid_rl.tasks.hurdle import (
   hurdle_levels,
   hurdle_pass_reward,
   hurdle_scaled_body_ang_vel,
-  hurdle_scaled_upright,
+  walking_joint_deviation_penalty,
   hurdle_stride_progress_reward,
   hurdle_truth,
   hurdle_vision,
+  reset_foot_friction_hurdle,
+  prefill_joint_pos_history,
   reset_root_state_hurdle,
 )
 from mjlab_kid_rl.tasks.symmetry import compute_symmetric_states
@@ -636,11 +638,11 @@ lateral command) without letting the policy permanently splay the legs out
 sideways."""
 
 
-SWING_FOOT_HEIGHT = 0.02
+SWING_FOOT_HEIGHT = 0.03
 """Foot height [m] the swing rewards aim for, measured from the stud tips: target of
 foot_clearance, gait_phase_swing_clearance and swing_progress, and the lift
 required by feet_crossing, forward_step, yaw_step and lateral_swing_progress.
-0.03 until 2026-11-01."""
+0.03 until 2026-11-01, 0.02 until 2026-11-11."""
 
 
 SWING_MIN_AIR_TIME = 0.3
@@ -1113,7 +1115,7 @@ def make_kid_rl_velocity_env_cfg(
   # Before 0.3 s the per-step pay ramps linearly from 0 (just lifted) to 1, so
   # a short swing still earns more the longer the foot stays up.
   # Landing and overlong swings receive no air-time reward.
-  cfg.rewards["air_time"].weight = 1.5
+  cfg.rewards["air_time"].weight = 1.0
   # Two stepping terms from ROBOTIS cyclo_lab's K1 velocity task (which walks
   # without a gait clock), with that task's weights. The stand test is this
   # task's own (planar speed + |yaw rate| <= walking_threshold).
@@ -1123,7 +1125,7 @@ def make_kid_rl_velocity_env_cfg(
   # continued stepping keeps it. It needs no memory of which foot stepped last.
   cfg.rewards["feet_single_contact"] = RewardTermCfg(
     func=feet_single_contact_reward,
-    weight=1.0,
+    weight=0.1,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "command_name": "twist",
@@ -1145,19 +1147,20 @@ def make_kid_rl_velocity_env_cfg(
   )
   # Feet set wide under a walk command, the policy trembles forward by tapping
   # each foot down a few control steps after lifting it. Each landing after less
-  # than 0.2 s in the air costs (0.2 - air time) seconds: a 1-step tap (0.02 s)
-  # 0.18, a 0.1 s step 0.1, a 0.2 s step nothing.
+  # than SWING_MIN_AIR_TIME (0.3 s) in the air costs (0.3 - air time) seconds: a
+  # 1-step tap (0.02 s) 0.28, a 0.1 s step 0.2, a 0.3 s step nothing. Every env
+  # and every command (0.2 s except under a yaw command until 2026-11-10).
   cfg.rewards["short_air_time"] = RewardTermCfg(
     func=short_air_time_penalty,
-    weight=-20.0,
-    # 0.35 s under a yaw command (|yaw| > 0.05 rad/s), where the policy turned
-    # by trembling its feet; 0.2 s otherwise.
+    weight=-100.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
-      "min_air_time": 0.2,
+      "min_air_time": SWING_MIN_AIR_TIME,
       "command_name": "twist",
       "yaw_min_air_time": 0.3,
       "yaw_command_threshold": 0.05,
+      # Walking commands only (2026-11-11); settled_standing covers a stand.
+      "command_threshold": walking_threshold,
     },
   )
   # An airborne foot moving horizontally below 2 cm pays its xy speed, fading
@@ -1373,7 +1376,7 @@ def make_kid_rl_velocity_env_cfg(
   # of landed swings. Holding one foot up does not pay each step.
   cfg.rewards["swing_progress"] = RewardTermCfg(
     func=swing_progress_reward,
-    weight=1.5,
+    weight=2.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1470,7 +1473,7 @@ def make_kid_rl_velocity_env_cfg(
   # Reward sole alignment with the actual terrain normal only on landing.
   cfg.rewards["foot_landing_alignment"] = RewardTermCfg(
     func=foot_landing_alignment_reward,
-    weight=3.0,
+    weight=1.5,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1555,7 +1558,7 @@ def make_kid_rl_velocity_env_cfg(
   # is switched off (base_scale 0); base motion is left to velocity tracking.
   cfg.rewards["lateral_swing_progress"] = RewardTermCfg(
     func=lateral_swing_progress_reward,
-    weight=30.0,
+    weight=60.0,
     params={
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
@@ -1706,12 +1709,12 @@ def make_kid_rl_velocity_env_cfg(
   # (min, max) per axis. (0.3, 0.3) pushed every env the same way every time;
   # a symmetric range is what makes the push direction random.
   cfg.events["push_robot"].params["velocity_range"] = {
-    "x": (-0.1, 0.1),
-    "y": (-0.1, 0.1),
-    "z": (-0.1, 0.1),
-    "roll": (-0.1, 0.1),
-    "pitch": (-0.1, 0.1),
-    "yaw": (-0.1, 0.1),
+    "x": (-0.3, 0.3),
+    "y": (-0.3, 0.3),
+    "z": (-0.3, 0.3),
+    "roll": (-0.3, 0.3),
+    "pitch": (-0.3, 0.3),
+    "yaw": (-0.3, 0.3),
   }
   cfg.events["push_robot"].interval_range_s = (5.0, 10.0)
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
@@ -1722,6 +1725,12 @@ def make_kid_rl_velocity_env_cfg(
   # 0.1~0.15 로 낮추면 실기처럼 다리가 벌어진다"였는데, 실기를 마찰이 더 높은 바닥에서 돌려도
   # 결과가 같았다 (hip roll 실제/목표 움직임 0.81 -> 0.74, 명령 중 정지 65% -> 56%).
   cfg.events["foot_friction"].params["ranges"] = (0.8, 1.2)
+  # Servo zero-position error: every joint's position target is offset by a value
+  # drawn uniformly within +-3 deg once at startup (mjlab default +-0.015 rad).
+  cfg.events["encoder_bias"].params["bias_range"] = (
+    -float(np.deg2rad(3.0)),
+    float(np.deg2rad(3.0)),
+  )
   for side in ("left", "right"):
     for joint in ("hip", "ankle"):
       linkage = f"{side}_{joint}"
@@ -2060,6 +2069,15 @@ def make_kid_rl_hurdle_env_cfg(play: bool = False) -> KidRLVelocityEnvCfg:
     **{f.name: getattr(base_command, f.name) for f in fields(base_command)}
   )
   cfg.events["reset_base"].func = reset_root_state_hurdle
+  # Foot friction is drawn at every reset, after reset_base picks hurdle or walking:
+  # hurdle envs 0.6-1.0 (HURDLE_FOOT_FRICTION), walking envs the velocity range.
+  foot_friction = cfg.events["foot_friction"]
+  foot_friction.mode = "reset"
+  foot_friction.func = reset_foot_friction_hurdle
+  foot_friction.params = {
+    "asset_cfg": foot_friction.params["asset_cfg"],
+    "walking_range": foot_friction.params["ranges"],
+  }
 
   for group in ("actor", "critic"):
     # The last OBS_HISTORY_LENGTH frames, oldest first within each term. deepcopy:
@@ -2072,6 +2090,12 @@ def make_kid_rl_hurdle_env_cfg(play: bool = False) -> KidRLVelocityEnvCfg:
   # The actor sees the bar the way the robot's camera pipeline would report it; the
   # critic, which never deploys, sees the true bar.
   cfg.observations["actor"].terms["hurdle_vision"] = ObservationTermCfg(func=hurdle_vision)
+  # Every episode's actor joint_pos history starts from 5 consecutive policy.onnx
+  # joint targets, a random window of hurdle.RESET_JOINT_POS_SEQUENCE per reset,
+  # instead of 5 copies of the first frame.
+  cfg.events["prefill_joint_pos_history"] = EventTermCfg(
+    func=prefill_joint_pos_history, mode="startup"
+  )
   cfg.observations["critic"].terms["hurdle_truth"] = ObservationTermCfg(func=hurdle_truth)
 
   # RewardManager multiplies by step_dt=0.02: -20 costs 0.4 per step any robot geom
@@ -2103,7 +2127,7 @@ def make_kid_rl_hurdle_env_cfg(play: bool = False) -> KidRLVelocityEnvCfg:
       "sensor_name": FEET_GROUND_SENSOR_CFG.name,
       "height_sensor_name": FOOT_HEIGHT_SCAN_CFG.name,
       "asset_cfg": feet_cfg,
-      "min_height": 0.02,
+      "min_height": SWING_FOOT_HEIGHT,
       "target_height": 0.06,
     },
   )
@@ -2124,9 +2148,19 @@ def make_kid_rl_hurdle_env_cfg(play: bool = False) -> KidRLVelocityEnvCfg:
   # Roll/pitch rate costs 3x in hurdle envs (-3.0) and stays -1.0 in walking envs.
   cfg.rewards["body_ang_vel"].func = hurdle_scaled_body_ang_vel
   cfg.rewards["body_ang_vel"].params["hurdle_scale"] = 3.0
-  # Upright pays 3x in walking envs (3.0) and stays 1.0 in hurdle envs.
-  cfg.rewards["upright"].func = hurdle_scaled_upright
-  cfg.rewards["upright"].params["walking_scale"] = 3.0
+  # Walking envs only: squared deviation from HOME_KEYFRAME of the six leg pitch
+  # joints (hip, knee, ankle pitch, both legs), so the hurdle envs' high-lift,
+  # ankle-heavy stepping does not carry over to plain walking.
+  # x step_dt: -5 charges 0.01 per step for 0.1 rad^2 (e.g. 0.16 rad on 4 joints).
+  cfg.rewards["walking_joint_deviation"] = RewardTermCfg(
+    func=walking_joint_deviation_penalty,
+    weight=-5.0,
+    params={
+      "asset_cfg": SceneEntityCfg(
+        "robot", joint_names=(r"^(left|right)_(hip_pitch|knee_pitch|ankle_pitch)$",)
+      )
+    },
+  )
   # A diverged env would otherwise stop the whole run on RSL-RL's NaN check.
   cfg.terminations["nan_term"] = TerminationTermCfg(func=envs_mdp.nan_detection)
   # Success: hurdle.HURDLE_CONFIRM_TIME after crossing the bar, end the episode as a

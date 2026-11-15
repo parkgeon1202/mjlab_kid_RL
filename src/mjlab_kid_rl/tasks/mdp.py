@@ -2302,6 +2302,7 @@ def short_air_time_penalty(
     command_name: str | None = None,
     yaw_min_air_time: float | None = None,
     yaw_command_threshold: float = 0.05,
+    command_threshold: float | None = None,
 ) -> torch.Tensor:
     """Charge a landing that ends a swing shorter than ``min_air_time``.
 
@@ -2312,8 +2313,10 @@ def short_air_time_penalty(
     summed over feet; a swing of ``min_air_time`` or longer costs nothing, and
     so does every step on which no foot lands. Use with a negative weight.
 
-    Not gated on the command: a foot tapping the ground under a stand command is
-    the same tremor.
+    Not gated on the command by default: a foot tapping the ground under a stand
+    command is the same tremor. With ``command_name`` and ``command_threshold``
+    set, it only charges envs whose ``|v_xy| + |wz|`` command exceeds the
+    threshold, so a stand command costs nothing.
 
     With ``command_name`` and ``yaw_min_air_time`` set, envs whose |yaw command|
     exceeds ``yaw_command_threshold`` use ``yaw_min_air_time`` instead: turning
@@ -2330,7 +2333,13 @@ def short_air_time_penalty(
         turning = torch.abs(command[:, 2]) > yaw_command_threshold
         required = torch.where(turning, yaw_min_air_time, required)
     shortfall = torch.clamp(required.unsqueeze(-1) - last_air_time, min=0.0)
-    return (shortfall * first_contact.float()).sum(dim=1)
+    penalty = (shortfall * first_contact.float()).sum(dim=1)
+    if command_name is not None and command_threshold is not None:
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+        speed = torch.norm(command[:, :2], dim=-1) + torch.abs(command[:, 2])
+        penalty = penalty * (speed > command_threshold).float()
+    return penalty
 
 
 def low_swing_drag_penalty(

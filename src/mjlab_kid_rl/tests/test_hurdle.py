@@ -349,6 +349,7 @@ class TestHurdleLevels(unittest.TestCase):
     log = curriculum(env, torch.arange(n))
     return env.command.level.tolist(), log
 
+  @mock.patch.object(hurdle, "HURDLE_FIXED_LEVEL", None)
   def test_up_on_a_clean_pass_down_on_no_pass_stay_on_fall_after(self) -> None:
     top = hurdle.HURDLE_LEVELS - 1
     levels, log = self._run(
@@ -357,6 +358,14 @@ class TestHurdleLevels(unittest.TestCase):
     self.assertEqual(levels, [1, 0, 1, top])
     self.assertAlmostEqual(log["fell_after"].item(), 0.25)
     self.assertAlmostEqual(log["level1_success"].item(), 0.0)
+
+  @mock.patch.object(hurdle, "HURDLE_FIXED_LEVEL", hurdle.HURDLE_LEVELS - 1)
+  def test_fixed_level_never_moves(self) -> None:
+    top = hurdle.HURDLE_LEVELS - 1
+    levels, _ = self._run(
+      passed=[True, False], failed=[False, False], levels=[top, top]
+    )
+    self.assertEqual(levels, [top, top])
 
 
 class TestVisionSymmetry(unittest.TestCase):
@@ -482,3 +491,33 @@ def _forward(state: dict, obs: torch.Tensor) -> torch.Tensor:
 
 if __name__ == "__main__":
   unittest.main()
+
+
+def test_prefilled_history_fills_reset_rows_with_random_windows():
+  from mjlab_kid_rl.tasks.hurdle import _PrefilledHistory
+
+  buffer = _PrefilledHistory(max_len=3, batch_size=2, device="cpu")
+  buffer.sequence = torch.arange(10.0).unsqueeze(-1)
+  buffer.starts = torch.tensor([0, 4, 7])
+  allowed = {(0.0, 1.0, 2.0), (4.0, 5.0, 6.0), (7.0, 8.0, 9.0)}
+  buffer.append(torch.tensor([[99.0], [99.0]]))
+  for row in buffer.buffer[:, :, 0].tolist():
+    assert tuple(row) in allowed
+  kept = buffer.buffer[0, 1:, 0].tolist()
+  buffer.reset(batch_ids=[1])
+  buffer.append(torch.tensor([[50.0], [51.0]]))
+  rows = buffer.buffer[:, :, 0].tolist()
+  assert rows[0] == kept + [50.0]
+  assert tuple(rows[1]) in allowed
+
+
+def test_reset_sequence_windows_stay_inside_one_episode(tmp_path):
+  import numpy as np
+  from mjlab_kid_rl.tasks.hurdle import RESET_JOINT_POS_SEQUENCE, load_reset_sequence
+
+  path = tmp_path / "seq.npz"
+  np.savez(path, joint_pos_rel=np.zeros((8, 12), np.float32), episode=np.array([0, 0, 0, 0, 1, 1, 1, 1]))
+  _, starts = load_reset_sequence(path, 3, "cpu")
+  assert starts.tolist() == [0, 1, 4, 5]
+  sequence, starts = load_reset_sequence(RESET_JOINT_POS_SEQUENCE, 5, "cpu")
+  assert sequence.shape == (2000, 12) and len(starts) > 1900

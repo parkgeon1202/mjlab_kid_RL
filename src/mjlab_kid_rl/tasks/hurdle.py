@@ -36,7 +36,9 @@ from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
+from mjlab.envs.mdp.dr import geom_friction
 from mjlab.envs.mdp.events import reset_root_state_uniform
+from mjlab.utils.buffers import CircularBuffer
 from mjlab.tasks.velocity.mdp.rewards import body_angular_velocity_penalty
 from mjlab.utils.lab_api.math import (
   quat_apply_inverse,
@@ -49,7 +51,6 @@ from mjlab.utils.lab_api.math import (
 from mjlab_kid_rl.tasks.mdp import (
   UniformVelocityCommandWithRotation,
   UniformVelocityCommandWithRotationCfg,
-  upright,
 )
 
 if TYPE_CHECKING:
@@ -79,6 +80,10 @@ HURDLE_LEVEL_RANGES = (
 """Bar height range [m] of each curriculum level, lowest first. A reset draws the
 height uniformly within its level's range. The real bar is 5.3 cm."""
 HURDLE_LEVELS = len(HURDLE_LEVEL_RANGES)
+HURDLE_FIXED_LEVEL: int | None = HURDLE_LEVELS - 1
+"""Level every env starts on and keeps, or None to start at 0 and move by
+hurdle_levels. The last level (5.3-6.3 cm) since 2026-11-11; hurdle_levels still
+logs the outcomes."""
 HURDLE_GEOM_GROUP = 1
 """foot_height_scan only casts against group 0, so foot heights stay above the floor."""
 HURDLE_COLLISION_BITS = 2
@@ -98,6 +103,10 @@ HURDLE_SPAWN_JITTER = 0.05
 """Spawn x and y offset from the env origin of a hurdle env [m]."""
 HURDLE_PARK_OFFSET = (0.0, 50.0)
 """Where a flat env's bar waits, from its env origin [m]. Far past a 20 s walk."""
+HURDLE_FOOT_FRICTION = (0.6, 1.0)
+"""Foot friction range of a hurdle env, drawn at every reset. Walking envs keep the
+velocity task's range. The foot geoms have priority 1, so this is the contact's
+friction whatever the floor's."""
 
 HURDLE_FOOT_RADIUS = math.hypot(0.0675, 0.0475)
 """Half diagonal of the foot sole box [m], kid_RL_irc.xml *_foot_collision_1."""
@@ -341,8 +350,10 @@ class HurdleVelocityCommand(UniformVelocityCommandWithRotation):
     num_envs = env.num_envs
     self.is_hurdle = torch.zeros(num_envs, dtype=torch.bool, device=device)
     """[B] This episode has a bar ahead. Set by reset_root_state_hurdle."""
-    self.level = torch.zeros(num_envs, dtype=torch.long, device=device)
-    """[B] Height level, moved by hurdle_levels."""
+    self.level = torch.full(
+      (num_envs,), HURDLE_FIXED_LEVEL or 0, dtype=torch.long, device=device
+    )
+    """[B] Height level, moved by hurdle_levels unless HURDLE_FIXED_LEVEL is set."""
     self.height = torch.zeros(num_envs, device=device)
     """[B] Bar height [m]."""
     self.bar_pos_w = torch.zeros((num_envs, 3), device=device)
@@ -472,6 +483,88 @@ def _set_bar_heights(
   first = (ids == 0).nonzero(as_tuple=False).flatten()
   if len(first) > 0:
     env.sim.mj_model.geom_size[geoms.cpu().numpy(), 2] = heights[first[0]].item() / 2
+
+
+RESET_JOINT_POS_SEQUENCE = Path(__file__).parent / "data" / "reset_joint_pos_sequence.npz"
+"""2000 steps of policy.onnx (flat IRC policy, 2026-11-02_02-17-02) joint targets
+(action x action_scale 0.5, joint_pos_rel order, rad) in one flat IRC training env,
+twist command forced to resample every 2 s (scripts/record_onnx_actions.py,
+2026-11-11). Every reset starts the actor joint_pos history from a random window."""
+
+
+class _PrefilledHistory(CircularBuffer):
+  """CircularBuffer whose freshly reset rows get, in place of the first frame copied
+  into every slot, a random window of ``sequence`` (oldest first) starting at one of
+  ``starts``."""
+
+  sequence: torch.Tensor
+  starts: torch.Tensor
+
+  def append(self, data: torch.Tensor) -> None:
+    first = self._num_pushes == 0
+    super().append(data)
+    num = int(first.sum())
+    if num == 0:
+      return
+    pick = torch.randint(len(self.starts), (num,), device=self.starts.device)
+    frames = self.starts[pick].unsqueeze(1) + torch.arange(self._max_len, device=self.starts.device)
+    windows = self.sequence[frames]  # [num, max_len, dim], oldest first
+    for k in range(self._max_len):
+      self._buffer[(self._pointer + 1 + k) % self._max_len, first] = windows[:, k]
+
+
+def load_reset_sequence(
+  path: Path, length: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Return (sequence [steps, dim], start of every ``length`` window inside one
+  episode) from a scripts/record_onnx_actions.py npz."""
+  import numpy as np
+
+  data = np.load(path)
+  sequence = torch.tensor(data["joint_pos_rel"], dtype=torch.float32, device=device)
+  episode = torch.tensor(data["episode"], device=device)
+  last = len(sequence) - length
+  candidates = torch.arange(last + 1, device=device)
+  starts = candidates[episode[candidates] == episode[candidates + length - 1]]
+  return sequence, starts
+
+
+def prefill_joint_pos_history(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  group: str = "actor",
+  term: str = "joint_pos",
+  path: Path = RESET_JOINT_POS_SEQUENCE,
+) -> None:
+  """Startup: make ``group``'s ``term`` history start each episode from a random
+  window of RESET_JOINT_POS_SEQUENCE."""
+  del env_ids
+  buffer = env.observation_manager._group_obs_term_history_buffer[group][term]
+  buffer.__class__ = _PrefilledHistory
+  buffer.sequence, buffer.starts = load_reset_sequence(path, buffer.max_length, env.device)
+
+
+@requires_model_fields("geom_friction")
+def reset_foot_friction_hurdle(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  asset_cfg: SceneEntityCfg,
+  walking_range: tuple[float, float],
+  hurdle_range: tuple[float, float] = HURDLE_FOOT_FRICTION,
+) -> None:
+  """Draw each reset env's foot friction (one value for all its foot geoms) from
+  ``hurdle_range`` in a hurdle env and ``walking_range`` in a walking env.
+
+  Runs after reset_base, which decides this episode's is_hurdle.
+  """
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  is_hurdle = _command(env).is_hurdle[env_ids]
+  for ids, ranges in ((env_ids[is_hurdle], hurdle_range), (env_ids[~is_hurdle], walking_range)):
+    if len(ids) > 0:
+      geom_friction(
+        env, ids, ranges=ranges, asset_cfg=asset_cfg, operation="abs", shared_random=True
+      )
 
 
 @requires_model_fields("geom_size", "geom_aabb", "geom_rbound")
@@ -732,12 +825,15 @@ def hurdle_scaled_body_ang_vel(
   return penalty * scale
 
 
-class hurdle_scaled_upright(upright):
-  """mdp.upright, times ``walking_scale`` in walking envs and 1 in hurdle envs."""
-
-  def __call__(self, env: ManagerBasedRlEnv, walking_scale: float, **kwargs) -> torch.Tensor:
-    reward = super().__call__(env, **kwargs)
-    return reward * torch.where(_command(env).is_hurdle, 1.0, walking_scale)
+def walking_joint_deviation_penalty(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+  """Sum over ``asset_cfg``'s joints of (joint_pos - default_joint_pos)^2 [rad^2] in
+  walking envs, 0 in hurdle envs. Use with a negative weight."""
+  asset: Entity = env.scene[asset_cfg.name]
+  ids = asset_cfg.joint_ids
+  deviation = asset.data.joint_pos[:, ids] - asset.data.default_joint_pos[:, ids]
+  return deviation.square().sum(dim=-1) * (~_command(env).is_hurdle).float()
 
 
 class hurdle_pass_reward:
@@ -1067,7 +1163,8 @@ class hurdle_levels:
     up = hurdle & passed & ~failed
     down = hurdle & ~passed
     moved = levels + up.long() - down.long()
-    command.level[env_ids] = moved.clamp(0, HURDLE_LEVELS - 1)
+    if HURDLE_FIXED_LEVEL is None:
+      command.level[env_ids] = moved.clamp(0, HURDLE_LEVELS - 1)
 
     log = {
       "mean": command.level.float().mean(),
