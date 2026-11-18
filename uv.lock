@@ -102,7 +102,7 @@ wheels = [
 [[package]]
 name = "better-actuator-models"
 version = "1.0.2"
-source = { git = "https://github.com/parkgeon1202/bam.git?branch=merge-upstream#dbeebb618f9ff42e593bfb0271ccdc3b47e346e5" }
+source = { git = "https://github.com/parkgeon1202/bam.git?branch=merge-upstream#ca4a5e34f29b74255f9dd74c563314b41903eaf3" }
 dependencies = [
     { name = "colorama" },
     { name = "numpy" },
