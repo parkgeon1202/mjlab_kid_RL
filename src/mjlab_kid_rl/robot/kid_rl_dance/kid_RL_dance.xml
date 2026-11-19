@@ -250,12 +250,12 @@
                       <geom type="mesh" mesh="left_ankle_cap_1" pos="0.02582 -0.055099 0.330834" euler="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="0.85 0.85 0.85 1" />
                       <inertial pos="0.0025594700 -2.6812024e-07 2.2326419e-07" mass="0.0008848618" diaginertia="1.06614075e-08 1.14980143e-08 1.66189119e-08" />
                       <joint name="left_ankle_roll_cap" pos="0 0 0" axis="1 0 0" range="-1.92 1.92" armature="1e-3" frictionloss="0.00005" damping="0.0005" />
-                      <geom name="left_ankle_cap" type="mesh" mesh="left_hip_cap_1_col" pos="0.00335 0 0" contype="16" conaffinity="16" group="2" rgba="0 1 1 1" solref="0.0002 1" solimp="0.9 0.99 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
+                      <geom name="left_ankle_cap" type="mesh" mesh="left_hip_cap_1_col" pos="0.00335 0 0" contype="16" conaffinity="16" group="2" rgba="0 1 1 1" solref="0.0002 1" solimp="0.99 0.999 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
                     </body>
                   </body>
                 </body>
-                <geom name="left_ankle_groove_wall1" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 0.019580 0.02445" contype="16" conaffinity="16" group="2" rgba="1 1 0 0.7" solref="0.0002 1" solimp="0.9 0.99 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
-                <geom name="left_ankle_groove_wall2" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 0.029380 0.02445" contype="16" conaffinity="16" group="2" rgba="1 0.4 0.7 0.7" solref="0.0002 1" solimp="0.9 0.99 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
+                <geom name="left_ankle_groove_wall1" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 0.019580 0.02445" contype="16" conaffinity="16" group="2" rgba="1 1 0 0.7" solref="0.0002 1" solimp="0.99 0.999 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
+                <geom name="left_ankle_groove_wall2" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 0.029380 0.02445" contype="16" conaffinity="16" group="2" rgba="1 0.4 0.7 0.7" solref="0.0002 1" solimp="0.99 0.999 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
               </body>
             </body>
           </body>
@@ -337,12 +337,12 @@
                       <geom type="mesh" mesh="right_ankle_cap_1" pos="0.027602 0.055312 0.329834" euler="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2" rgba="0.85 0.85 0.85 1" />
                       <inertial pos="0.0025594932 2.8342795e-07 -2.8442857e-07" mass="0.0008848618" diaginertia="1.06614055e-08 1.14980151e-08 1.66189111e-08" />
                       <joint name="right_ankle_roll_cap" pos="0 0 0" axis="1 0 0" range="-1.92 1.92" armature="1e-3" frictionloss="0.00005" damping="0.0005" />
-                      <geom name="right_ankle_cap" type="mesh" mesh="left_hip_cap_1_col" pos="0.00335 0 0" contype="16" conaffinity="16" group="2" rgba="0 1 1 1" solref="0.0002 1" solimp="0.9 0.99 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
+                      <geom name="right_ankle_cap" type="mesh" mesh="left_hip_cap_1_col" pos="0.00335 0 0" contype="16" conaffinity="16" group="2" rgba="0 1 1 1" solref="0.0002 1" solimp="0.99 0.999 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
                     </body>
                   </body>
                 </body>
-                <geom name="right_ankle_groove_wall1" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 -0.029437 0.02445" contype="16" conaffinity="16" group="2" rgba="1 1 0 0.7" solref="0.0002 1" solimp="0.9 0.99 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
-                <geom name="right_ankle_groove_wall2" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 -0.019637 0.02445" contype="16" conaffinity="16" group="2" rgba="1 0.4 0.7 0.7" solref="0.0002 1" solimp="0.9 0.99 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
+                <geom name="right_ankle_groove_wall1" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 -0.029437 0.02445" contype="16" conaffinity="16" group="2" rgba="1 1 0 0.7" solref="0.0002 1" solimp="0.99 0.999 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
+                <geom name="right_ankle_groove_wall2" type="box" size="0.0005 0.0005 0.02568" pos="-0.02987 -0.019637 0.02445" contype="16" conaffinity="16" group="2" rgba="1 0.4 0.7 0.7" solref="0.0002 1" solimp="0.99 0.999 0.00002 0.5 2" friction="0.2 0.005 0.0001" />
               </body>
             </body>
           </body>
